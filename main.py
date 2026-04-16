@@ -1294,6 +1294,11 @@ def health():
     with _cache_lock:
         return jsonify({"status": "ok", "last_updated": _last_updated}), 200
 
+@app.route("/api/signals")
+def get_signals():
+    with _cache_lock:
+        return jsonify({"signals": list(_signal_cache)})
+
 # ─────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────
