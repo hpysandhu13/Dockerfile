@@ -35,16 +35,25 @@ log = logging.getLogger("SignalBot")
 # ─────────────────────────────────────────────
 WATCHLIST = {
     "crypto": [
-        {"id": "BTC/USDT",  "label": "Bitcoin",        "exchange": "binance"},
-        {"id": "ETH/USDT",  "label": "Ethereum",       "exchange": "binance"},
+        {"id": "BTC/USDT",  "label": "Bitcoin",    "exchange": "binance"},
+        {"id": "ETH/USDT",  "label": "Ethereum",   "exchange": "binance"},
+        {"id": "SOL/USDT",  "label": "Solana",     "exchange": "binance"},
+        {"id": "BNB/USDT",  "label": "BNB",        "exchange": "binance"},
+        {"id": "XRP/USDT",  "label": "XRP",        "exchange": "binance"},
+        {"id": "AVAX/USDT", "label": "Avalanche",  "exchange": "binance"},
     ],
     "forex": [
         {"id": "EURUSD=X",  "label": "EUR/USD"},
         {"id": "GBPUSD=X",  "label": "GBP/USD"},
+        {"id": "USDJPY=X",  "label": "USD/JPY"},
+        {"id": "AUDUSD=X",  "label": "AUD/USD"},
     ],
     "commodity": [
         {"id": "GC=F",      "label": "Gold"},
         {"id": "SI=F",      "label": "Silver"},
+        {"id": "CL=F",      "label": "Crude Oil"},
+        {"id": "NG=F",      "label": "Nat. Gas"},
+        {"id": "PL=F",      "label": "Platinum"},
     ],
 }
 
@@ -58,7 +67,7 @@ VOLUME_THRESHOLD = 1.50   # 50 % above avg
 ATR_MULTIPLIER   = 1.5
 MIN_CANDLES      = 220    # need at least EMA_PERIOD + buffer
 
-REFRESH_SECONDS  = 60
+REFRESH_SECONDS  = 30   # 30s cycle — faster signal detection
 
 # ─────────────────────────────────────────────
 #  DATABASE  (optional – bot runs without it)
