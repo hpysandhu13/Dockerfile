@@ -1,26 +1,21 @@
 FROM python:3.10-slim
 
-# Prevent Python from writing .pyc files and enable unbuffered logging
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Step 1: Install system-level dependencies for Pandas and Postgres
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install system dependencies for pandas/psycopg2
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python requirements
+# Step 2: Install Python libraries
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the code
+# Step 3: Copy your Pro Bot code
 COPY . .
 
-# Run as a non-privileged user for security
-RUN useradd -m botuser
-USER botuser
-
+# Step 4: Run the bot
 CMD ["python", "main.py"]
