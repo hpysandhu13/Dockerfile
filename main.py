@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v3.0              ║
+║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v4.0              ║
 ║     Smart Money Confluence Engine — WebSocket Live Feed      ║
-║     Strategy: 200 EMA + RSI(14) + Volume Spread Analysis     ║
+║     Strategy: EMA 9/50 + RSI(14) Cross-50 + VSA             ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -58,15 +58,15 @@ WATCHLIST = {
     ],
 }
 
-# Strategy params
-EMA_PERIOD       = 200
+# Strategy params — Intraday Confluence (EMA 9/50 + RSI Cross-50 + VSA)
+EMA_FAST         = 9
+EMA_SLOW         = 50
 RSI_PERIOD       = 14
-RSI_OVERSOLD     = 30
-RSI_OVERBOUGHT   = 70
+RSI_MID          = 50    # crossover trigger threshold
 VOLUME_LOOKBACK  = 10
 VOLUME_THRESHOLD = 1.50   # 50 % above avg
-ATR_MULTIPLIER   = 1.5
-MIN_CANDLES      = 220    # need at least EMA_PERIOD + buffer
+ATR_MULTIPLIER   = 1.0    # tighter intraday stop (1× ATR)
+MIN_CANDLES      = 70     # need at least EMA_SLOW + buffer
 
 REFRESH_SECONDS  = 60   # Full signal / indicator cycle interval
 EMIT_SECONDS     = 1    # WebSocket emission cadence
@@ -105,7 +105,9 @@ def init_db():
                     entry_high  NUMERIC,
                     stop_loss   NUMERIC,
                     rsi         NUMERIC,
-                    ema200      NUMERIC
+                    ema9        NUMERIC,
+                    ema50       NUMERIC,
+                    vsa         BOOLEAN
                 )
             """)
         conn.commit()
@@ -123,9 +125,9 @@ def log_signal_to_db(row: dict):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO signals
-                  (asset, asset_class, signal, price, entry_low, entry_high, stop_loss, rsi, ema200)
+                  (asset, asset_class, signal, price, entry_low, entry_high, stop_loss, rsi, ema9, ema50, vsa)
                 VALUES (%(asset)s, %(asset_class)s, %(signal)s, %(price)s,
-                        %(entry_low)s, %(entry_high)s, %(stop_loss)s, %(rsi)s, %(ema200)s)
+                        %(entry_low)s, %(entry_high)s, %(stop_loss)s, %(rsi)s, %(ema9)s, %(ema50)s, %(vsa)s)
             """, row)
         conn.commit()
     except Exception as e:
@@ -139,15 +141,18 @@ def log_signal_to_db(row: dict):
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14) -> float:
+def rsi_series(series: pd.Series, period: int = 14) -> pd.Series:
+    """Return the full RSI series (needed for crossover detection)."""
     delta  = series.diff().dropna()
     gain   = delta.clip(lower=0)
     loss   = -delta.clip(upper=0)
     avg_g  = gain.ewm(com=period - 1, adjust=False).mean()
     avg_l  = loss.ewm(com=period - 1, adjust=False).mean()
     rs     = avg_g / avg_l.replace(0, np.nan)
-    rsi_s  = 100 - (100 / (1 + rs))
-    return round(float(rsi_s.iloc[-1]), 2)
+    return 100 - (100 / (1 + rs))
+
+def rsi(series: pd.Series, period: int = 14) -> float:
+    return round(float(rsi_series(series, period).iloc[-1]), 2)
 
 def atr(df: pd.DataFrame, period: int = 14) -> float:
     high, low, close = df["High"], df["Low"], df["Close"]
@@ -159,22 +164,27 @@ def atr(df: pd.DataFrame, period: int = 14) -> float:
     ], axis=1).max(axis=1)
     return float(tr.ewm(com=period - 1, adjust=False).mean().iloc[-1])
 
-def volume_spike(df: pd.DataFrame) -> bool:
-    """True if latest volume > 150 % of the prior 10-candle average."""
+def institutional_loading(df: pd.DataFrame) -> bool:
+    """True if latest volume ≥ 150% of 10-candle avg AND candle spread > 10-period avg spread (VSA)."""
     if len(df) < VOLUME_LOOKBACK + 1:
         return False
-    recent_avg = df["Volume"].iloc[-(VOLUME_LOOKBACK + 1):-1].mean()
-    if recent_avg == 0:
+    recent_avg_vol = df["Volume"].iloc[-(VOLUME_LOOKBACK + 1):-1].mean()
+    if recent_avg_vol == 0:
         return False
-    return float(df["Volume"].iloc[-1]) >= recent_avg * VOLUME_THRESHOLD
+    if float(df["Volume"].iloc[-1]) < recent_avg_vol * VOLUME_THRESHOLD:
+        return False
+    spread     = df["High"] - df["Low"]
+    avg_spread = float(spread.iloc[-(VOLUME_LOOKBACK + 1):-1].mean())
+    return avg_spread > 0 and float(spread.iloc[-1]) > avg_spread
 
 # ─────────────────────────────────────────────
 #  SIGNAL LOGIC
 # ─────────────────────────────────────────────
 def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
     """
-    Returns a signal dict.  Never raises – all errors produce NEUTRAL.
-    Entry zone and stop loss are always populated when price data is available.
+    Intraday confluence signal using dual EMA (9/50), RSI cross-50, and VSA.
+    Scores 0-3 factors:  3 → STRONG, 2 → WEAK, <2 → NEUTRAL.
+    Never raises – all errors produce NEUTRAL.
     """
     base = {
         "asset": label,
@@ -185,7 +195,9 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         "entry_high": None,
         "stop_loss": None,
         "rsi": None,
-        "ema200": None,
+        "ema9": None,
+        "ema50": None,
+        "vsa": False,
         "error": None,
     }
 
@@ -194,32 +206,61 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
             base["error"] = "Insufficient data"
             return base
 
-        df = df.copy()
-        price      = float(df["Close"].iloc[-1])
-        ema200_val = float(ema(df["Close"], EMA_PERIOD).iloc[-1])
-        rsi_val    = rsi(df["Close"], RSI_PERIOD)
-        atr_val    = atr(df)
-        vol_spike  = volume_spike(df)
+        df    = df.copy()
+        close = df["Close"]
+        price = float(close.iloc[-1])
 
-        base["price"]  = round(price, 5)
-        base["rsi"]    = rsi_val
-        base["ema200"] = round(ema200_val, 5)
+        # ── Dual EMA trend detection ─────────────────────────────────────
+        ema9_s    = ema(close, EMA_FAST)
+        ema50_s   = ema(close, EMA_SLOW)
+        ema9_val  = float(ema9_s.iloc[-1])
+        ema50_val = float(ema50_s.iloc[-1])
+
+        # ── RSI cross-50 detection (needs two consecutive values) ────────
+        rsi_s    = rsi_series(close, RSI_PERIOD)
+        rsi_val  = round(float(rsi_s.iloc[-1]), 2)
+        rsi_prev = float(rsi_s.iloc[-2]) if len(rsi_s) >= 2 else rsi_val
+
+        atr_val   = atr(df)
+        inst_load = institutional_loading(df)
+
+        base["price"] = round(price, 5)
+        base["rsi"]   = rsi_val
+        base["ema9"]  = round(ema9_val, 5)
+        base["ema50"] = round(ema50_val, 5)
+        base["vsa"]   = inst_load
 
         sl_distance = ATR_MULTIPLIER * atr_val
 
-        # ── Always show entry zone and ATR-based stop loss ──────────────
+        # ── Always populate entry zone and default (long-side) stop ─────
         base["entry_low"]  = round(price * 0.999, 5)
         base["entry_high"] = round(price * 1.001, 5)
-        # Default stop is long-side (below price); overridden for SELL signals
         base["stop_loss"]  = round(price - sl_distance, 5)
 
-        # ── STRONG BUY confluences ──────────────────────────────────────
-        if price > ema200_val and rsi_val < RSI_OVERSOLD and vol_spike:
-            base["signal"] = "STRONG BUY ▲"
+        # ── Factor 1: EMA trend ──────────────────────────────────────────
+        ema_bullish = price > ema9_val and ema9_val > ema50_val
+        ema_bearish = price < ema9_val and ema9_val < ema50_val
 
-        # ── STRONG SELL confluences ─────────────────────────────────────
-        elif price < ema200_val and rsi_val > RSI_OVERBOUGHT and vol_spike:
-            base["signal"]   = "STRONG SELL ▼"
+        # ── Factor 2: RSI cross-50 trigger ───────────────────────────────
+        rsi_cross_above = rsi_prev < RSI_MID <= rsi_val   # bullish crossover
+        rsi_cross_below = rsi_prev > RSI_MID >= rsi_val   # bearish crossover
+
+        # ── Factor 3: Institutional loading (VSA) ───────────────────────
+        # inst_load is already computed above
+
+        # ── Score and emit signal ────────────────────────────────────────
+        buy_score  = int(ema_bullish) + int(rsi_cross_above) + int(inst_load)
+        sell_score = int(ema_bearish) + int(rsi_cross_below) + int(inst_load)
+
+        if buy_score >= 3:
+            base["signal"] = "STRONG BUY ▲"
+        elif buy_score == 2:
+            base["signal"] = "WEAK BUY ▲"
+        elif sell_score >= 3:
+            base["signal"]    = "STRONG SELL ▼"
+            base["stop_loss"] = round(price + sl_distance, 5)
+        elif sell_score == 2:
+            base["signal"]    = "WEAK SELL ▼"
             base["stop_loss"] = round(price + sl_distance, 5)
 
     except Exception as e:
@@ -271,7 +312,8 @@ def fetch_yfinance(ticker: str, label: str, asset_class: str) -> dict:
             log.warning(f"yfinance: no/insufficient data for {ticker}")
             return {"asset": label, "asset_class": asset_class.upper(),
                     "signal": "NEUTRAL", "price": None, "rsi": None,
-                    "ema200": None, "entry_low": None, "entry_high": None,
+                    "ema9": None, "ema50": None, "vsa": False,
+                    "entry_low": None, "entry_high": None,
                     "stop_loss": None, "error": "Market closed or no data"}
 
         # yfinance MultiIndex fix
@@ -292,7 +334,8 @@ def fetch_yfinance(ticker: str, label: str, asset_class: str) -> dict:
         log.warning(f"yfinance fetch error [{ticker}]: {e}")
         return {"asset": label, "asset_class": asset_class.upper(),
                 "signal": "NEUTRAL", "price": None, "rsi": None,
-                "ema200": None, "entry_low": None, "entry_high": None,
+                "ema9": None, "ema50": None, "vsa": False,
+                "entry_low": None, "entry_high": None,
                 "stop_loss": None, "error": str(e)}
 
 
@@ -301,12 +344,13 @@ def fetch_ccxt(symbol: str, label: str, exchange_id: str = "binance") -> dict:
         exchange_class = getattr(ccxt, exchange_id)
         exchange = exchange_class({"enableRateLimit": True})
 
-        # Fetch 300 daily candles (plenty for 200 EMA)
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=300)
+        # Fetch 200 candles (plenty for EMA50 + buffer)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=200)
         if not ohlcv or len(ohlcv) < MIN_CANDLES:
             return {"asset": label, "asset_class": "CRYPTO",
                     "signal": "NEUTRAL", "price": None, "rsi": None,
-                    "ema200": None, "entry_low": None, "entry_high": None,
+                    "ema9": None, "ema50": None, "vsa": False,
+                    "entry_low": None, "entry_high": None,
                     "stop_loss": None, "error": "Insufficient OHLCV data"}
 
         df = pd.DataFrame(ohlcv, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
@@ -331,7 +375,8 @@ def fetch_ccxt(symbol: str, label: str, exchange_id: str = "binance") -> dict:
         log.warning(f"ccxt fetch error [{symbol}]: {e}")
         return {"asset": label, "asset_class": "CRYPTO",
                 "signal": "NEUTRAL", "price": None, "rsi": None,
-                "ema200": None, "entry_low": None, "entry_high": None,
+                "ema9": None, "ema50": None, "vsa": False,
+                "entry_low": None, "entry_high": None,
                 "stop_loss": None, "error": str(e)}
 
 # ─────────────────────────────────────────────
@@ -366,7 +411,9 @@ def run_all_signals():
                 "entry_high":  r.get("entry_high"),
                 "stop_loss":   r.get("stop_loss"),
                 "rsi":         r.get("rsi"),
-                "ema200":      r.get("ema200"),
+                "ema9":        r.get("ema9"),
+                "ema50":       r.get("ema50"),
+                "vsa":         r.get("vsa", False),
             })
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -592,12 +639,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="hdr">
   <div>
     <div class="logo">SIGNAL<span>IQ</span></div>
-    <div class="tagline">Institutional Smart Money Confluence Engine · WebSocket Live Feed</div>
+    <div class="tagline">Intraday Confluence Engine · EMA 9/50 + RSI Cross-50 + VSA · WebSocket Live Feed</div>
   </div>
   <div class="hdr-right">
     <div class="stat-item">
       <span class="stat-label">Strategy</span>
-      <span class="stat-val" style="font-size:10px;">EMA200 · RSI14 · VSA</span>
+      <span class="stat-val" style="font-size:10px;">EMA9/50 · RSI14 · VSA</span>
     </div>
     <div class="stat-item">
       <span class="stat-label">Last Updated</span>
@@ -611,10 +658,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="strategy-bar">
-  <span class="badge">EMA 200 Trend Filter</span>
-  <span class="badge">RSI &lt;30 / &gt;70 Extreme</span>
-  <span class="badge">Vol Spike ≥ 150% Avg</span>
-  <span class="badge">Stop = 1.5× ATR</span>
+  <span class="badge">EMA 9/50 Dual Trend Filter</span>
+  <span class="badge">RSI Cross 50 Trigger</span>
+  <span class="badge">Vol Spike ≥ 150% + Spread &gt; Avg</span>
+  <span class="badge">Stop = 1.0× ATR</span>
   <span class="badge">15 Assets Live</span>
 </div>
 
@@ -694,7 +741,7 @@ function signalTag(sig) {
 
 function rsiTag(v) {
   if (v == null) return '<span class="rsi-chip">—</span>';
-  const cls = v < 30 ? 'rsi-low' : v > 70 ? 'rsi-high' : '';
+  const cls = v < 50 ? 'rsi-low' : v > 50 ? 'rsi-high' : '';
   return `<span class="rsi-chip ${cls}">${v}</span>`;
 }
 
