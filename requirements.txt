@@ -1,2 +1,7 @@
-# Used for fetching market data in trading cycles
-requests==2.32.3
+ccxt
+yfinance
+pandas
+pandas_ta
+psycopg2-binary
+textblob
+requests
