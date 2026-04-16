@@ -1,0 +1,2 @@
+# Used for fetching market data in trading cycles
+requests==2.32.3
