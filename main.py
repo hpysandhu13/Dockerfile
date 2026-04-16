@@ -203,8 +203,9 @@ def _has_fvg_near_zone(df: pd.DataFrame, zone_low: float, zone_high: float,
     highs  = df["High"].values
     lows   = df["Low"].values
     n      = len(df)
-    zone_mid  = (zone_low + zone_high) / 2
-    proximity = (zone_high - zone_low) * 3.0 or zone_mid * 0.001
+    zone_mid   = (zone_low + zone_high) / 2
+    zone_width = zone_high - zone_low
+    proximity  = zone_width * 3.0 if zone_width != 0 else zone_mid * 0.001
 
     for i in range(max(2, n - 30), n):
         # Bullish FVG
@@ -249,8 +250,9 @@ def find_order_block(
 
     Returns
     -------
-    (ob_low, ob_high, status)
-        status ∈ {'FOUND', 'SCANNING', 'WAITING'}
+    (ob_low, ob_high, status, ob_side)
+        status  ∈ {'FOUND', 'SCANNING', 'WAITING'}
+        ob_side ∈ {'bull', 'bear', None}
     """
     min_required = OB_VOLUME_LOOKBACK + DISPLACEMENT_BARS + 5
     if len(df) < min_required:
@@ -277,7 +279,7 @@ def find_order_block(
 
         # Bullish displacement: close breaks above prior swing high
         if closes[i] > float(window_highs.max()):
-            for j in range(i - 1, max(i - 20, OB_VOLUME_LOOKBACK), -1):
+            for j in range(i - 1, max(0, i - 20), -1):
                 if closes[j] < opens[j]:   # bearish candle → bullish OB
                     ob_index = j
                     ob_side  = "bull"
@@ -289,7 +291,7 @@ def find_order_block(
 
         # Bearish displacement: close breaks below prior swing low
         elif closes[i] < float(window_lows.min()):
-            for j in range(i - 1, max(i - 20, OB_VOLUME_LOOKBACK), -1):
+            for j in range(i - 1, max(0, i - 20), -1):
                 if closes[j] > opens[j]:   # bullish candle → bearish OB
                     ob_index = j
                     ob_side  = "bear"
@@ -435,15 +437,15 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         rsi_cross_below = rsi_prev > RSI_MID >= rsi_val   # bearish crossover
 
         # ── STRONG signal: OB zone touch + RSI reset (45–55) ────────────
-        # Direction must agree with the OB side (bull OB → BUY, bear OB → SELL)
-        # and be confirmed by the EMA trend.
+        # STRONG signals are gated purely on the OB qualification, price
+        # entering the zone, and RSI being in the neutral reset band (45–55).
+        # Direction flows directly from the OB type:
+        #   bull OB (bearish candle before upward displacement) → STRONG BUY
+        #   bear OB (bullish candle before downward displacement) → STRONG SELL
         rsi_reset     = RSI_ZONE_LOW <= rsi_val <= RSI_ZONE_HIGH
         price_in_zone = ob_status == "FOUND" and ob_low <= price <= ob_high
 
         if price_in_zone and rsi_reset:
-            # Direction is determined by the OB type:
-            # bull OB (bearish candle before upward displacement) → STRONG BUY
-            # bear OB (bullish candle before downward displacement) → STRONG SELL
             if ob_side == "bull":
                 base["signal"]    = "STRONG BUY ▲"
             elif ob_side == "bear":
