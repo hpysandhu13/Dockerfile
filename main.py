@@ -1,3 +1,11 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v2.0              ║
+║     Smart Money Confluence Engine                            ║
+║     Strategy: 200 EMA + RSI(14) + Volume Spread Analysis    ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
 import os
 import logging
 import threading
