@@ -68,6 +68,15 @@ VOLUME_THRESHOLD = 1.50   # 50 % above avg
 ATR_MULTIPLIER   = 1.0    # tighter intraday stop (1× ATR)
 MIN_CANDLES      = 70     # need at least EMA_SLOW + buffer
 
+# Order Block / Sniper Entry params
+OB_VOLUME_THRESHOLD = 2.0    # >200 % of rolling avg — required for a valid OB
+OB_VOLUME_LOOKBACK  = 20     # periods used to compute the OB volume average
+RSI_ZONE_LOW        = 45     # RSI must be inside [45, 55] for a STRONG signal
+RSI_ZONE_HIGH       = 55
+DISPLACEMENT_BARS   = 10     # swing high/low lookback to identify a displacement move
+CRYPTO_MAX_ZONE_PCT = 0.001  # max OB zone width: 0.1 % of price (crypto)
+FOREX_MAX_ZONE_PIPS = 5      # max OB zone width: 5 pips (forex / commodity)
+
 REFRESH_SECONDS  = 60   # Full signal / indicator cycle interval
 EMIT_SECONDS     = 1    # WebSocket emission cadence
 
@@ -178,27 +187,198 @@ def institutional_loading(df: pd.DataFrame) -> bool:
     return avg_spread > 0 and float(spread.iloc[-1]) > avg_spread
 
 # ─────────────────────────────────────────────
+#  ORDER BLOCK / SNIPER ENTRY HELPERS
+# ─────────────────────────────────────────────
+def _has_fvg_near_zone(df: pd.DataFrame, zone_low: float, zone_high: float,
+                       side: str) -> bool:
+    """
+    Return True if there is an unfilled Fair Value Gap in the last 30 candles
+    that is adjacent to (or overlapping) the order-block zone.
+
+    Bullish FVG : candle[i].low > candle[i-2].high  →  gap above candle[i-2]
+    Bearish FVG : candle[i].high < candle[i-2].low  →  gap below candle[i-2]
+
+    The zone must be within 3× its own width of the FVG edge to qualify.
+    """
+    highs  = df["High"].values
+    lows   = df["Low"].values
+    n      = len(df)
+    zone_mid  = (zone_low + zone_high) / 2
+    proximity = (zone_high - zone_low) * 3.0 or zone_mid * 0.001
+
+    for i in range(max(2, n - 30), n):
+        # Bullish FVG
+        if lows[i] > highs[i - 2]:
+            fvg_low = highs[i - 2]
+            if side == "bull" and (
+                (zone_low <= fvg_low <= zone_high)
+                or abs(zone_mid - fvg_low) <= proximity
+            ):
+                return True
+        # Bearish FVG
+        if highs[i] < lows[i - 2]:
+            fvg_high = lows[i - 2]
+            if side == "bear" and (
+                (zone_low <= fvg_high <= zone_high)
+                or abs(zone_mid - fvg_high) <= proximity
+            ):
+                return True
+
+    return False
+
+
+def find_order_block(
+    df: pd.DataFrame, asset_class: str
+) -> tuple:
+    """
+    Identify the most recent institutional Order Block (OB) before a
+    significant displacement move and return a tight entry zone.
+
+    Algorithm
+    ---------
+    1. Scan backwards through the candle series for a displacement candle —
+       one that closes beyond the highest high or lowest low of the prior
+       DISPLACEMENT_BARS candles.
+    2. The OB is the last *opposite-coloured* candle immediately before that
+       displacement.
+    3. Reject the OB if its volume < OB_VOLUME_THRESHOLD × 20-period avg.
+       → return (None, None, 'SCANNING')
+    4. Narrow the raw candle body to the asset-class max width constraint.
+    5. Require an unfilled FVG adjacent to the zone.
+       → return (None, None, 'WAITING') if no FVG present.
+
+    Returns
+    -------
+    (ob_low, ob_high, status)
+        status ∈ {'FOUND', 'SCANNING', 'WAITING'}
+    """
+    min_required = OB_VOLUME_LOOKBACK + DISPLACEMENT_BARS + 5
+    if len(df) < min_required:
+        return None, None, "WAITING", None
+
+    closes = df["Close"].values
+    opens  = df["Open"].values
+    highs  = df["High"].values
+    lows   = df["Low"].values
+    vols   = df["Volume"].values
+    n      = len(df)
+
+    ob_low  = ob_high = None
+    ob_side  = None
+    ob_index = None
+
+    # Search the last 60 candles for a displacement
+    search_start = n - 1
+    search_end   = max(DISPLACEMENT_BARS + OB_VOLUME_LOOKBACK, n - 60)
+
+    for i in range(search_start, search_end, -1):
+        window_highs = highs[i - DISPLACEMENT_BARS:i]
+        window_lows  = lows[i - DISPLACEMENT_BARS:i]
+
+        # Bullish displacement: close breaks above prior swing high
+        if closes[i] > float(window_highs.max()):
+            for j in range(i - 1, max(i - 20, OB_VOLUME_LOOKBACK), -1):
+                if closes[j] < opens[j]:   # bearish candle → bullish OB
+                    ob_index = j
+                    ob_side  = "bull"
+                    ob_low   = float(lows[j])
+                    ob_high  = float(highs[j])
+                    break
+            if ob_index is not None:
+                break
+
+        # Bearish displacement: close breaks below prior swing low
+        elif closes[i] < float(window_lows.min()):
+            for j in range(i - 1, max(i - 20, OB_VOLUME_LOOKBACK), -1):
+                if closes[j] > opens[j]:   # bullish candle → bearish OB
+                    ob_index = j
+                    ob_side  = "bear"
+                    ob_low   = float(lows[j])
+                    ob_high  = float(highs[j])
+                    break
+            if ob_index is not None:
+                break
+
+    if ob_index is None:
+        return None, None, "WAITING", None
+
+    # ── Volume gate ───────────────────────────────────────────────────────
+    vol_slice = vols[max(0, ob_index - OB_VOLUME_LOOKBACK):ob_index]
+    avg_vol   = float(vol_slice.mean()) if len(vol_slice) > 0 else 0.0
+    if avg_vol <= 0 or float(vols[ob_index]) < OB_VOLUME_THRESHOLD * avg_vol:
+        return None, None, "SCANNING", None
+
+    # ── Narrow zone to max width ──────────────────────────────────────────
+    price = float(closes[-1])
+    mid   = (ob_low + ob_high) / 2.0
+
+    if asset_class == "CRYPTO":
+        max_width = price * CRYPTO_MAX_ZONE_PCT
+    else:
+        # 5 pips: standard pairs use 0.0001 per pip; JPY-crosses & commodities
+        # with price > 20 use 0.01 per pip.
+        pip_size  = 0.01 if price > 20 else 0.0001
+        max_width = FOREX_MAX_ZONE_PIPS * pip_size
+
+    half = max_width / 2.0
+    ob_low  = mid - half
+    ob_high = mid + half
+
+    # ── FVG alignment check ───────────────────────────────────────────────
+    if not _has_fvg_near_zone(df, ob_low, ob_high, ob_side):
+        return None, None, "WAITING", None
+
+    return ob_low, ob_high, "FOUND", ob_side
+
+
+# ─────────────────────────────────────────────
 #  SIGNAL LOGIC
 # ─────────────────────────────────────────────
 def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
     """
-    Intraday confluence signal using dual EMA (9/50), RSI cross-50, and VSA.
-    Scores 0-3 factors:  3 → STRONG, 2 → WEAK, <2 → NEUTRAL.
-    Never raises – all errors produce NEUTRAL.
+    Intraday confluence signal using dual EMA (9/50), RSI cross-50, VSA,
+    and an institutional Order Block entry zone.
+
+    Entry zone
+    ----------
+    * Derived from the last opposite-coloured candle before a significant
+      displacement move (Order Block), provided:
+        - OB candle volume > 200 % of the 20-period rolling average
+        - Zone width ≤ 0.1 % of price (crypto) or 5 pips (forex/commodity)
+        - An unfilled Fair Value Gap exists adjacent to the zone
+    * When no qualifying OB is found: entry_low / entry_high are None and
+      entry_zone_label is 'WAITING'.
+    * When an OB is found but volume is insufficient: 'SCANNING...'.
+
+    Signal grading
+    --------------
+    STRONG BUY / STRONG SELL :
+        OB zone is valid (FOUND) AND price is inside the zone AND
+        RSI is between 45 and 55 (indicating a reset before a new leg).
+        Direction is determined by the EMA trend (bullish / bearish).
+    WEAK BUY / WEAK SELL :
+        At least 2 of the 3 EMA / RSI-cross / VSA factors align
+        (existing behaviour — kept as a secondary signal).
+    NEUTRAL :
+        All other cases.
+
+    Never raises — all errors produce NEUTRAL.
     """
     base = {
-        "asset": label,
-        "asset_class": asset_class.upper(),
-        "price": None,
-        "signal": "NEUTRAL",
-        "entry_low": None,
-        "entry_high": None,
-        "stop_loss": None,
-        "rsi": None,
-        "ema9": None,
-        "ema50": None,
-        "vsa": False,
-        "error": None,
+        "asset":            label,
+        "asset_class":      asset_class.upper(),
+        "price":            None,
+        "signal":           "NEUTRAL",
+        "entry_low":        None,
+        "entry_high":       None,
+        "entry_zone_label": "WAITING",
+        "entry_zone_locked": False,
+        "stop_loss":        None,
+        "rsi":              None,
+        "ema9":             None,
+        "ema50":            None,
+        "vsa":              False,
+        "error":            None,
     }
 
     try:
@@ -231,37 +411,54 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         base["vsa"]   = inst_load
 
         sl_distance = ATR_MULTIPLIER * atr_val
+        base["stop_loss"] = round(price - sl_distance, 5)
 
-        # ── Always populate entry zone and default (long-side) stop ─────
-        base["entry_low"]  = round(price * 0.999, 5)
-        base["entry_high"] = round(price * 1.001, 5)
-        base["stop_loss"]  = round(price - sl_distance, 5)
+        # ── Order Block entry zone ───────────────────────────────────────
+        ob_low, ob_high, ob_status, ob_side = find_order_block(df, asset_class.upper())
 
-        # ── Factor 1: EMA trend ──────────────────────────────────────────
+        if ob_status == "FOUND":
+            base["entry_low"]         = round(ob_low, 5)
+            base["entry_high"]        = round(ob_high, 5)
+            base["entry_zone_label"]  = "FOUND"
+            base["entry_zone_locked"] = True   # do not overwrite with realtime price
+        elif ob_status == "SCANNING":
+            base["entry_zone_label"] = "SCANNING..."
+        else:
+            base["entry_zone_label"] = "WAITING"
+
+        # ── EMA trend helpers ────────────────────────────────────────────
         ema_bullish = price > ema9_val and ema9_val > ema50_val
         ema_bearish = price < ema9_val and ema9_val < ema50_val
 
-        # ── Factor 2: RSI cross-50 trigger ───────────────────────────────
+        # ── RSI cross-50 trigger ─────────────────────────────────────────
         rsi_cross_above = rsi_prev < RSI_MID <= rsi_val   # bullish crossover
         rsi_cross_below = rsi_prev > RSI_MID >= rsi_val   # bearish crossover
 
-        # ── Factor 3: Institutional loading (VSA) ───────────────────────
-        # inst_load is already computed above
+        # ── STRONG signal: OB zone touch + RSI reset (45–55) ────────────
+        # Direction must agree with the OB side (bull OB → BUY, bear OB → SELL)
+        # and be confirmed by the EMA trend.
+        rsi_reset     = RSI_ZONE_LOW <= rsi_val <= RSI_ZONE_HIGH
+        price_in_zone = ob_status == "FOUND" and ob_low <= price <= ob_high
 
-        # ── Score and emit signal ────────────────────────────────────────
-        buy_score  = int(ema_bullish) + int(rsi_cross_above) + int(inst_load)
-        sell_score = int(ema_bearish) + int(rsi_cross_below) + int(inst_load)
+        if price_in_zone and rsi_reset:
+            # Direction is determined by the OB type:
+            # bull OB (bearish candle before upward displacement) → STRONG BUY
+            # bear OB (bullish candle before downward displacement) → STRONG SELL
+            if ob_side == "bull":
+                base["signal"]    = "STRONG BUY ▲"
+            elif ob_side == "bear":
+                base["signal"]    = "STRONG SELL ▼"
+                base["stop_loss"] = round(price + sl_distance, 5)
+        else:
+            # ── WEAK fallback: existing 3-factor confluence ───────────────
+            buy_score  = int(ema_bullish) + int(rsi_cross_above) + int(inst_load)
+            sell_score = int(ema_bearish) + int(rsi_cross_below) + int(inst_load)
 
-        if buy_score >= 3:
-            base["signal"] = "STRONG BUY ▲"
-        elif buy_score == 2:
-            base["signal"] = "WEAK BUY ▲"
-        elif sell_score >= 3:
-            base["signal"]    = "STRONG SELL ▼"
-            base["stop_loss"] = round(price + sl_distance, 5)
-        elif sell_score == 2:
-            base["signal"]    = "WEAK SELL ▼"
-            base["stop_loss"] = round(price + sl_distance, 5)
+            if buy_score == 2:
+                base["signal"] = "WEAK BUY ▲"
+            elif sell_score == 2:
+                base["signal"]    = "WEAK SELL ▼"
+                base["stop_loss"] = round(price + sl_distance, 5)
 
     except Exception as e:
         log.warning(f"Signal compute error [{label}]: {e}")
@@ -273,16 +470,21 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
 #  DATA FETCHERS
 # ─────────────────────────────────────────────
 def _apply_realtime_price(result: dict, rt: float, atr_val: float) -> None:
-    """Override price and recalculate entry/stop around the live price in-place."""
+    """Override price and recalculate stop around the live price in-place.
+
+    The entry zone is NOT updated when it was set by an Order Block
+    (entry_zone_locked == True) — the OB zone must remain stable.
+    """
     sl_distance = ATR_MULTIPLIER * atr_val
-    result["price"]      = round(rt, 5)
-    if result.get("entry_low") is not None:
-        result["entry_low"]  = round(rt * 0.999, 5)
-        result["entry_high"] = round(rt * 1.001, 5)
-        if "SELL" in result["signal"]:
-            result["stop_loss"] = round(rt + sl_distance, 5)
-        else:
-            result["stop_loss"] = round(rt - sl_distance, 5)
+    result["price"] = round(rt, 5)
+    if not result.get("entry_zone_locked", False):
+        # No OB zone: clear any stale price-based zone so it does not display
+        result["entry_low"]  = None
+        result["entry_high"] = None
+    if "SELL" in result["signal"]:
+        result["stop_loss"] = round(rt + sl_distance, 5)
+    else:
+        result["stop_loss"] = round(rt - sl_distance, 5)
 
 
 def _yf_realtime_price(ticker: str) -> Optional[float]:
@@ -824,12 +1026,24 @@ function buildTable(signals) {
   tableBuilt = true;
 }
 
+// ── Entry Zone display helper ──────────────────────────────────────────
+function zoneDisplay(r) {
+  const d = pDec(r.asset);
+  const lbl = r.entry_zone_label || '';
+  if (r.entry_low != null && r.entry_high != null) {
+    // Valid OB zone: show the tight price spread
+    return `<span style="color:var(--cyan);">${fmt(r.entry_low, d)}&nbsp;–&nbsp;${fmt(r.entry_high, d)}</span>`;
+  }
+  if (lbl === 'SCANNING...') {
+    return `<span style="color:var(--amber);letter-spacing:1px;">SCANNING...</span>`;
+  }
+  // WAITING or any other state: empty cell
+  return `<span style="color:var(--muted);">WAITING</span>`;
+}
+
 // ── Build all <td> content for a row ──────────────────────────────────
 function buildCells(r, dir) {
-  const d    = pDec(r.asset);
-  const zone = (r.entry_low != null && r.entry_high != null)
-    ? `${fmt(r.entry_low, d)} – ${fmt(r.entry_high, d)}`
-    : '—';
+  const d   = pDec(r.asset);
   const sl  = r.stop_loss != null
     ? `<span style="color:var(--red);">${fmt(r.stop_loss, d)}</span>`
     : '—';
@@ -845,7 +1059,7 @@ function buildCells(r, dir) {
     <td>${signalTag(r.signal)}</td>
     <td><canvas class="spark" width="80" height="26"></canvas></td>
     <td>${rsiTag(r.rsi)}</td>
-    <td style="font-size:11px;">${zone}</td>
+    <td style="font-size:11px;">${zoneDisplay(r)}</td>
     <td style="font-size:11px;">${sl}</td>
   `;
 }
@@ -894,10 +1108,7 @@ function updateRow(r) {
 
   // Refresh entry zone and stop loss on every tick
   if (cells[7]) {
-    const zone = (r.entry_low != null && r.entry_high != null)
-      ? `${fmt(r.entry_low, d)} – ${fmt(r.entry_high, d)}`
-      : '—';
-    cells[7].innerHTML = `<span style="font-size:11px;">${zone}</span>`;
+    cells[7].innerHTML = `<span style="font-size:11px;">${zoneDisplay(r)}</span>`;
   }
   if (cells[8]) {
     const sl = r.stop_loss != null
