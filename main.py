@@ -174,6 +174,7 @@ def volume_spike(df: pd.DataFrame) -> bool:
 def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
     """
     Returns a signal dict.  Never raises – all errors produce NEUTRAL.
+    Entry zone and stop loss are always populated when price data is available.
     """
     base = {
         "asset": label,
@@ -206,18 +207,19 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
 
         sl_distance = ATR_MULTIPLIER * atr_val
 
+        # ── Always show entry zone and ATR-based stop loss ──────────────
+        base["entry_low"]  = round(price * 0.999, 5)
+        base["entry_high"] = round(price * 1.001, 5)
+        # Default stop is long-side (below price); overridden for SELL signals
+        base["stop_loss"]  = round(price - sl_distance, 5)
+
         # ── STRONG BUY confluences ──────────────────────────────────────
         if price > ema200_val and rsi_val < RSI_OVERSOLD and vol_spike:
-            base["signal"]    = "STRONG BUY ▲"
-            base["entry_low"] = round(price * 0.999, 5)   # tight entry band
-            base["entry_high"]= round(price * 1.001, 5)
-            base["stop_loss"] = round(price - sl_distance, 5)
+            base["signal"] = "STRONG BUY ▲"
 
         # ── STRONG SELL confluences ─────────────────────────────────────
         elif price < ema200_val and rsi_val > RSI_OVERBOUGHT and vol_spike:
-            base["signal"]    = "STRONG SELL ▼"
-            base["entry_low"] = round(price * 0.999, 5)
-            base["entry_high"]= round(price * 1.001, 5)
+            base["signal"]   = "STRONG SELL ▼"
             base["stop_loss"] = round(price + sl_distance, 5)
 
     except Exception as e:
@@ -229,6 +231,33 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
 # ─────────────────────────────────────────────
 #  DATA FETCHERS
 # ─────────────────────────────────────────────
+def _apply_realtime_price(result: dict, rt: float, atr_val: float) -> None:
+    """Override price and recalculate entry/stop around the live price in-place."""
+    sl_distance = ATR_MULTIPLIER * atr_val
+    result["price"]      = round(rt, 5)
+    if result.get("entry_low") is not None:
+        result["entry_low"]  = round(rt * 0.999, 5)
+        result["entry_high"] = round(rt * 1.001, 5)
+        if "SELL" in result["signal"]:
+            result["stop_loss"] = round(rt + sl_distance, 5)
+        else:
+            result["stop_loss"] = round(rt - sl_distance, 5)
+
+
+def _yf_realtime_price(ticker: str) -> Optional[float]:
+    """Return the live/current price for a yfinance ticker, or None on failure."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price = getattr(fi, "last_price", None)
+        if price is None or price == 0:
+            price = getattr(fi, "regular_market_price", None)
+        if price and float(price) > 0:
+            return float(price)
+    except Exception as e:
+        log.debug(f"fast_info unavailable for {ticker}: {e}")
+    return None
+
+
 def fetch_yfinance(ticker: str, label: str, asset_class: str) -> dict:
     try:
         raw = yf.download(
@@ -250,7 +279,14 @@ def fetch_yfinance(ticker: str, label: str, asset_class: str) -> dict:
             raw.columns = raw.columns.get_level_values(0)
 
         raw = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return compute_signal(raw, label, asset_class)
+        result = compute_signal(raw, label, asset_class)
+
+        # Override price with live quote (more accurate than yesterday's close)
+        rt = _yf_realtime_price(ticker)
+        if rt is not None:
+            _apply_realtime_price(result, rt, atr(raw))
+
+        return result
 
     except Exception as e:
         log.warning(f"yfinance fetch error [{ticker}]: {e}")
@@ -278,7 +314,18 @@ def fetch_ccxt(symbol: str, label: str, exchange_id: str = "binance") -> dict:
         df.set_index("ts", inplace=True)
         df = df.astype(float)
 
-        return compute_signal(df, label, "CRYPTO")
+        result = compute_signal(df, label, "CRYPTO")
+
+        # Override price with live ticker (real-time, not last candle close)
+        try:
+            ticker_data = exchange.fetch_ticker(symbol)
+            rt = ticker_data.get("last")
+            if rt and float(rt) > 0:
+                _apply_realtime_price(result, float(rt), atr(df))
+        except Exception as te:
+            log.debug(f"ccxt fetch_ticker failed for {symbol}: {te}")
+
+        return result
 
     except Exception as e:
         log.warning(f"ccxt fetch error [{symbol}]: {e}")
@@ -792,11 +839,25 @@ function updateRow(r) {
     }
   }
 
-  // Update Change %, Signal, RSI via cell index (stable column order)
+  // Update Change %, Signal, RSI, Entry Zone, Stop Loss via cell index (stable column order)
   const cells = row.cells;
   if (cells[3]) cells[3].innerHTML = chgTag(r.change_pct);
   if (cells[4]) cells[4].innerHTML = signalTag(r.signal);
   if (cells[6]) cells[6].innerHTML = rsiTag(r.rsi);
+
+  // Refresh entry zone and stop loss on every tick
+  if (cells[7]) {
+    const zone = (r.entry_low != null && r.entry_high != null)
+      ? `${fmt(r.entry_low, d)} – ${fmt(r.entry_high, d)}`
+      : '—';
+    cells[7].innerHTML = `<span style="font-size:11px;">${zone}</span>`;
+  }
+  if (cells[8]) {
+    const sl = r.stop_loss != null
+      ? `<span style="color:var(--red);font-size:11px;">${fmt(r.stop_loss, d)}</span>`
+      : '—';
+    cells[8].innerHTML = sl;
+  }
 
   // Redraw sparkline
   const canvas = row.querySelector('.spark');
