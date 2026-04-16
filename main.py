@@ -1,8 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v4.0              ║
+║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v5.0              ║
 ║     Smart Money Confluence Engine — WebSocket Live Feed      ║
-║     Strategy: EMA 9/50 + RSI(14) Cross-50 + VSA             ║
+║     Strategy: Sniper Calculation — FVG/OB + RSI Reset +      ║
+║               EMA Pullback + RVOL ≥ 1.8 Institutional Gate  ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -65,17 +66,22 @@ RSI_PERIOD       = 14
 RSI_MID          = 50    # crossover trigger threshold
 VOLUME_LOOKBACK  = 10
 VOLUME_THRESHOLD = 1.50   # 50 % above avg
-ATR_MULTIPLIER   = 1.0    # tighter intraday stop (1× ATR)
+ATR_MULTIPLIER   = 1.0    # fallback stop (1× ATR) when no swing stop is available
 MIN_CANDLES      = 70     # need at least EMA_SLOW + buffer
 
 # Order Block / Sniper Entry params
-OB_VOLUME_THRESHOLD = 2.0    # >200 % of rolling avg — required for a valid OB
-OB_VOLUME_LOOKBACK  = 20     # periods used to compute the OB volume average
-RSI_ZONE_LOW        = 45     # RSI must be inside [45, 55] for a STRONG signal
-RSI_ZONE_HIGH       = 55
-DISPLACEMENT_BARS   = 10     # swing high/low lookback to identify a displacement move
-CRYPTO_MAX_ZONE_PCT = 0.001  # max OB zone width: 0.1 % of price (crypto)
-FOREX_MAX_ZONE_PIPS = 5      # max OB zone width: 5 pips (forex / commodity)
+OB_VOLUME_THRESHOLD     = 2.0    # >200 % of rolling avg — required for a valid OB
+OB_VOLUME_LOOKBACK      = 20     # periods used to compute the OB volume average
+OB_SEARCH_CANDLES       = 20     # how many candles back to look for an OB before the displacement
+RSI_ZONE_LOW            = 48     # RSI must be inside [48, 52] for STRONG signal — Momentum Reset component
+RSI_ZONE_HIGH           = 52
+DISPLACEMENT_BARS       = 10     # swing high/low lookback to identify a displacement move
+CRYPTO_MAX_ZONE_PCT     = 0.001  # max OB zone width: 0.1 % of price (crypto)
+FOREX_MAX_ZONE_PIPS     = 5      # max OB zone width: 5 pips (forex / commodity)
+RVOL_THRESHOLD          = 1.8    # Minimum Relative Volume to confirm institutional activity
+ATR_DISPLACEMENT_PERIOD = 10     # ATR period used to qualify a displacement candle
+ATR_DISPLACEMENT_MULT   = 2.5    # Body size must exceed this multiple of ATR(10)
+MIN_FVG_LOOKBACK        = 2      # candles before displacement required to form a 3-candle FVG sequence
 
 REFRESH_SECONDS  = 60   # Full signal / indicator cycle interval
 EMIT_SECONDS     = 1    # WebSocket emission cadence
@@ -186,6 +192,20 @@ def institutional_loading(df: pd.DataFrame) -> bool:
     avg_spread = float(spread.iloc[-(VOLUME_LOOKBACK + 1):-1].mean())
     return avg_spread > 0 and float(spread.iloc[-1]) > avg_spread
 
+
+def rvol(df: pd.DataFrame, lookback: int = 20) -> float:
+    """Return Relative Volume = current volume / SMA(volume, lookback).
+
+    Used as an institutional-activity gate: RVOL < RVOL_THRESHOLD means
+    there is insufficient participation to confirm a displacement move.
+    """
+    if len(df) < lookback + 1:
+        return 0.0
+    sma_vol = float(df["Volume"].iloc[-(lookback + 1):-1].mean())
+    if sma_vol <= 0:
+        return 0.0
+    return float(df["Volume"].iloc[-1]) / sma_vol
+
 # ─────────────────────────────────────────────
 #  ORDER BLOCK / SNIPER ENTRY HELPERS
 # ─────────────────────────────────────────────
@@ -232,31 +252,40 @@ def find_order_block(
     df: pd.DataFrame, asset_class: str
 ) -> tuple:
     """
-    Identify the most recent institutional Order Block (OB) before a
-    significant displacement move and return a tight entry zone.
+    Identify an institutional displacement and return a Sniper Entry Zone.
 
-    Algorithm
-    ---------
-    1. Scan backwards through the candle series for a displacement candle —
-       one that closes beyond the highest high or lowest low of the prior
-       DISPLACEMENT_BARS candles.
-    2. The OB is the last *opposite-coloured* candle immediately before that
-       displacement.
-    3. Reject the OB if its volume < OB_VOLUME_THRESHOLD × 20-period avg.
-       → return (None, None, 'SCANNING')
-    4. Narrow the raw candle body to the asset-class max width constraint.
-    5. Require an unfilled FVG adjacent to the zone.
-       → return (None, None, 'WAITING') if no FVG present.
+    Algorithm — Sniper Calculation
+    --------------------------------
+    1. Compute a rolling ATR(10) series for every candle.
+    2. Scan backwards for a *Displacement Candle* whose body size
+       (|Close − Open|) exceeds ATR_DISPLACEMENT_MULT × ATR(10).
+    3. Fair Value Gap (FVG) — for the 3-candle sequence ending at the
+       displacement candle (Candle 1 = disp−2, Candle 3 = displacement):
+         • Bullish FVG : Low[C3] > High[C1]
+         • Bearish FVG : High[C3] < Low[C1]
+       Entry zone is set to the 0.5 Mean Threshold (midpoint) of the FVG.
+    4. If no clean FVG exists, fall back to the Institutional Order Block —
+       the last opposite-direction candle immediately before the displacement.
+    5. RVOL gate : if RVOL < RVOL_THRESHOLD, return WAITING.
+       Low RVOL signals insufficient institutional participation.
+    6. OB candle volume gate : OB volume must exceed OB_VOLUME_THRESHOLD ×
+       OB_VOLUME_LOOKBACK-period rolling average, otherwise return SCANNING.
+    7. Narrow the entry zone to the asset-class maximum width constraint.
+    8. When using an OB fallback zone, require an unfilled FVG adjacent to
+       it (existing alignment guard).
+    9. Stop Loss is the swing low (bull) or swing high (bear) of the prior
+       DISPLACEMENT_BARS candles — the origin of the displacement move.
 
     Returns
     -------
-    (ob_low, ob_high, status, ob_side)
-        status  ∈ {'FOUND', 'SCANNING', 'WAITING'}
-        ob_side ∈ {'bull', 'bear', None}
+    (entry_low, entry_high, status, ob_side, swing_stop)
+        status     ∈ {'FOUND', 'SCANNING', 'WAITING'}
+        ob_side    ∈ {'bull', 'bear', None}
+        swing_stop : float | None — displacement-move stop level
     """
     min_required = OB_VOLUME_LOOKBACK + DISPLACEMENT_BARS + 5
     if len(df) < min_required:
-        return None, None, "WAITING", None
+        return None, None, "WAITING", None, None
 
     closes = df["Close"].values
     opens  = df["Open"].values
@@ -265,72 +294,131 @@ def find_order_block(
     vols   = df["Volume"].values
     n      = len(df)
 
-    ob_low  = ob_high = None
-    ob_side  = None
-    ob_index = None
+    # ── ATR(10) series for displacement body-size gate ────────────────────
+    prev_closes = np.empty_like(closes)
+    prev_closes[0]  = closes[0]
+    prev_closes[1:] = closes[:-1]
+    tr_arr = np.maximum.reduce([
+        highs - lows,
+        np.abs(highs - prev_closes),
+        np.abs(lows  - prev_closes),
+    ])
+    atr10_vals = pd.Series(tr_arr).ewm(
+        com=ATR_DISPLACEMENT_PERIOD - 1, adjust=False
+    ).mean().values
+    body_sizes = np.abs(closes - opens)
 
-    # Search the last 60 candles for a displacement
+    ob_low     = ob_high = None
+    ob_side    = None
+    ob_index   = None          # OB candle index (for volume gate)
+    disp_index = None          # displacement candle index
+    has_fvg    = False
+    swing_stop = None
+
     search_start = n - 1
     search_end   = max(DISPLACEMENT_BARS + OB_VOLUME_LOOKBACK, n - 60)
 
     for i in range(search_start, search_end, -1):
-        window_highs = highs[i - DISPLACEMENT_BARS:i]
-        window_lows  = lows[i - DISPLACEMENT_BARS:i]
+        # ── Displacement candle check: body > 2.5× ATR(10) ───────────────
+        if body_sizes[i] <= ATR_DISPLACEMENT_MULT * atr10_vals[i]:
+            continue
 
-        # Bullish displacement: close breaks above prior swing high
-        if closes[i] > float(window_highs.max()):
-            for j in range(i - 1, max(0, i - 20), -1):
-                if closes[j] < opens[j]:   # bearish candle → bullish OB
-                    ob_index = j
-                    ob_side  = "bull"
-                    ob_low   = float(lows[j])
-                    ob_high  = float(highs[j])
-                    break
-            if ob_index is not None:
+        is_bull_disp = closes[i] > opens[i]
+        swing_start  = max(0, i - DISPLACEMENT_BARS)
+
+        # ── Try FVG first (requires at least MIN_FVG_LOOKBACK candles before displacement)
+        if i >= MIN_FVG_LOOKBACK:
+            if is_bull_disp and lows[i] > highs[i - 2]:
+                # Bullish FVG: gap between High[C1] and Low[C3]
+                fvg_mid  = (float(highs[i - 2]) + float(lows[i])) / 2.0
+                ob_low   = fvg_mid
+                ob_high  = fvg_mid
+                ob_side  = "bull"
+                has_fvg  = True
+                disp_index = i
+                swing_stop = float(lows[swing_start:i].min())
+                # OB = last bearish candle before displacement (for volume gate)
+                for j in range(i - 1, max(0, i - OB_SEARCH_CANDLES), -1):
+                    if closes[j] < opens[j]:
+                        ob_index = j
+                        break
                 break
 
-        # Bearish displacement: close breaks below prior swing low
-        elif closes[i] < float(window_lows.min()):
-            for j in range(i - 1, max(0, i - 20), -1):
-                if closes[j] > opens[j]:   # bullish candle → bearish OB
-                    ob_index = j
-                    ob_side  = "bear"
-                    ob_low   = float(lows[j])
-                    ob_high  = float(highs[j])
-                    break
-            if ob_index is not None:
+            elif not is_bull_disp and highs[i] < lows[i - 2]:
+                # Bearish FVG: gap between Low[C1] and High[C3]
+                fvg_mid  = (float(lows[i - 2]) + float(highs[i])) / 2.0
+                ob_low   = fvg_mid
+                ob_high  = fvg_mid
+                ob_side  = "bear"
+                has_fvg  = True
+                disp_index = i
+                swing_stop = float(highs[swing_start:i].max())
+                # OB = last bullish candle before displacement (for volume gate)
+                for j in range(i - 1, max(0, i - OB_SEARCH_CANDLES), -1):
+                    if closes[j] > opens[j]:
+                        ob_index = j
+                        break
                 break
 
-    if ob_index is None:
-        return None, None, "WAITING", None
+        # ── Fallback: Institutional Order Block (no clean FVG) ───────────
+        if is_bull_disp:
+            for j in range(i - 1, max(0, i - OB_SEARCH_CANDLES), -1):
+                if closes[j] < opens[j]:
+                    ob_index   = j
+                    ob_side    = "bull"
+                    ob_low     = float(lows[j])
+                    ob_high    = float(highs[j])
+                    disp_index = i
+                    swing_stop = float(lows[swing_start:i].min())
+                    break
+        else:
+            for j in range(i - 1, max(0, i - OB_SEARCH_CANDLES), -1):
+                if closes[j] > opens[j]:
+                    ob_index   = j
+                    ob_side    = "bear"
+                    ob_low     = float(lows[j])
+                    ob_high    = float(highs[j])
+                    disp_index = i
+                    swing_stop = float(highs[swing_start:i].max())
+                    break
 
-    # ── Volume gate ───────────────────────────────────────────────────────
-    vol_slice = vols[max(0, ob_index - OB_VOLUME_LOOKBACK):ob_index]
-    avg_vol   = float(vol_slice.mean()) if len(vol_slice) > 0 else 0.0
-    if avg_vol <= 0 or float(vols[ob_index]) < OB_VOLUME_THRESHOLD * avg_vol:
-        return None, None, "SCANNING", None
+        if ob_index is not None:
+            break
 
-    # ── Narrow zone to max width ──────────────────────────────────────────
+    if ob_index is None and not has_fvg:
+        return None, None, "WAITING", None, None
+
+    # ── RVOL gate: require institutional participation ────────────────────
+    rvol_val = rvol(df, lookback=OB_VOLUME_LOOKBACK)
+    if rvol_val < RVOL_THRESHOLD:
+        return None, None, "WAITING", None, None
+
+    # ── OB candle volume gate ─────────────────────────────────────────────
+    if ob_index is not None:
+        vol_slice = vols[max(0, ob_index - OB_VOLUME_LOOKBACK):ob_index]
+        avg_vol   = float(vol_slice.mean()) if len(vol_slice) > 0 else 0.0
+        if avg_vol <= 0 or float(vols[ob_index]) < OB_VOLUME_THRESHOLD * avg_vol:
+            return None, None, "SCANNING", None, None
+
+    # ── Narrow zone to asset-class max width ──────────────────────────────
     price = float(closes[-1])
     mid   = (ob_low + ob_high) / 2.0
 
     if asset_class == "CRYPTO":
         max_width = price * CRYPTO_MAX_ZONE_PCT
     else:
-        # 5 pips: standard pairs use 0.0001 per pip; JPY-crosses & commodities
-        # with price > 20 use 0.01 per pip.
         pip_size  = 0.01 if price > 20 else 0.0001
         max_width = FOREX_MAX_ZONE_PIPS * pip_size
 
-    half = max_width / 2.0
+    half    = max_width / 2.0
     ob_low  = mid - half
     ob_high = mid + half
 
-    # ── FVG alignment check ───────────────────────────────────────────────
-    if not _has_fvg_near_zone(df, ob_low, ob_high, ob_side):
-        return None, None, "WAITING", None
+    # ── FVG alignment guard (only for OB fallback zones) ─────────────────
+    if not has_fvg and not _has_fvg_near_zone(df, ob_low, ob_high, ob_side):
+        return None, None, "WAITING", None, None
 
-    return ob_low, ob_high, "FOUND", ob_side
+    return ob_low, ob_high, "FOUND", ob_side, swing_stop
 
 
 # ─────────────────────────────────────────────
@@ -338,31 +426,40 @@ def find_order_block(
 # ─────────────────────────────────────────────
 def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
     """
-    Intraday confluence signal using dual EMA (9/50), RSI cross-50, VSA,
-    and an institutional Order Block entry zone.
+    Sniper Calculation signal using institutional displacement detection,
+    FVG/OB entry zones, RSI Momentum Reset, EMA 9 pullback, and RVOL gate.
 
     Entry zone
     ----------
-    * Derived from the last opposite-coloured candle before a significant
-      displacement move (Order Block), provided:
-        - OB candle volume > 200 % of the 20-period rolling average
-        - Zone width ≤ 0.1 % of price (crypto) or 5 pips (forex/commodity)
-        - An unfilled Fair Value Gap exists adjacent to the zone
-    * When no qualifying OB is found: entry_low / entry_high are None and
+    * Derived from a Displacement Candle (body > 2.5× ATR(10)) followed by:
+        - A Fair Value Gap: gap between High[C1] and Low[C3] in the
+          3-candle displacement sequence.  Entry = midpoint (0.5 threshold).
+        - Fallback: the Institutional Order Block (last opposite-direction
+          candle before the displacement), provided OB volume > 200 % of the
+          20-period rolling average and an unfilled FVG aligns with the zone.
+    * RVOL (Current Volume / SMA Volume 20) must be ≥ 1.8 — otherwise the
+      entry zone stays WAITING (insufficient institutional participation).
+    * When no qualifying setup is found: entry_low / entry_high are None and
       entry_zone_label is 'WAITING'.
-    * When an OB is found but volume is insufficient: 'SCANNING...'.
+    * When displacement found but OB volume is insufficient: 'SCANNING...'.
 
-    Signal grading
-    --------------
-    STRONG BUY / STRONG SELL :
-        OB zone is valid (FOUND) AND price is inside the zone AND
-        RSI is between 45 and 55 (indicating a reset before a new leg).
-        Direction is determined by the EMA trend (bullish / bearish).
-    WEAK BUY / WEAK SELL :
-        At least 2 of the 3 EMA / RSI-cross / VSA factors align
-        (existing behaviour — kept as a secondary signal).
-    NEUTRAL :
-        All other cases.
+    Signal grading — STRONG BUY / STRONG SELL
+    -----------------------------------------
+    All three conditions must hold simultaneously:
+      1. Current price is within the Entry Zone (OB / FVG zone is FOUND).
+      2. RSI(14) is between 48 and 52 (Momentum Reset band).
+      3. EMA 9 is pulling back toward EMA 50 but has not yet crossed it
+         (EMA 9 > EMA 50 for bull; EMA 9 declining toward EMA 50).
+
+    Stop loss
+    ---------
+    * STRONG signal: swing low (bull) or swing high (bear) of the prior
+      DISPLACEMENT_BARS candles — the origin of the displacement move.
+    * Fallback / WEAK signal: ATR_MULTIPLIER × ATR(14) from current price.
+
+    WEAK BUY / WEAK SELL (secondary)
+    ---------------------------------
+    At least 2 of 3 factors align: EMA trend, RSI cross-50, VSA.
 
     Never raises — all errors produce NEUTRAL.
     """
@@ -376,10 +473,12 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         "entry_zone_label": "WAITING",
         "entry_zone_locked": False,
         "stop_loss":        None,
+        "stop_loss_locked": False,
         "rsi":              None,
         "ema9":             None,
         "ema50":            None,
         "vsa":              False,
+        "rvol":             None,
         "error":            None,
     }
 
@@ -397,6 +496,7 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         ema50_s   = ema(close, EMA_SLOW)
         ema9_val  = float(ema9_s.iloc[-1])
         ema50_val = float(ema50_s.iloc[-1])
+        ema9_prev = float(ema9_s.iloc[-2]) if len(ema9_s) >= 2 else ema9_val
 
         # ── RSI cross-50 detection (needs two consecutive values) ────────
         rsi_s    = rsi_series(close, RSI_PERIOD)
@@ -405,18 +505,22 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
 
         atr_val   = atr(df)
         inst_load = institutional_loading(df)
+        rvol_val  = rvol(df, lookback=OB_VOLUME_LOOKBACK)
 
         base["price"] = round(price, 5)
         base["rsi"]   = rsi_val
         base["ema9"]  = round(ema9_val, 5)
         base["ema50"] = round(ema50_val, 5)
         base["vsa"]   = inst_load
+        base["rvol"]  = round(rvol_val, 2)
 
         sl_distance = ATR_MULTIPLIER * atr_val
         base["stop_loss"] = round(price - sl_distance, 5)
 
-        # ── Order Block entry zone ───────────────────────────────────────
-        ob_low, ob_high, ob_status, ob_side = find_order_block(df, asset_class.upper())
+        # ── Order Block / FVG entry zone ─────────────────────────────────
+        ob_low, ob_high, ob_status, ob_side, swing_stop = find_order_block(
+            df, asset_class.upper()
+        )
 
         if ob_status == "FOUND":
             base["entry_low"]         = round(ob_low, 5)
@@ -433,24 +537,34 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
         ema_bearish = price < ema9_val and ema9_val < ema50_val
 
         # ── RSI cross-50 trigger ─────────────────────────────────────────
-        rsi_cross_above = rsi_prev < RSI_MID <= rsi_val   # bullish crossover
-        rsi_cross_below = rsi_prev > RSI_MID >= rsi_val   # bearish crossover
+        rsi_cross_above = rsi_prev < RSI_MID <= rsi_val
+        rsi_cross_below = rsi_prev > RSI_MID >= rsi_val
 
-        # ── STRONG signal: OB zone touch + RSI reset (45–55) ────────────
-        # STRONG signals are gated purely on the OB qualification, price
-        # entering the zone, and RSI being in the neutral reset band (45–55).
-        # Direction flows directly from the OB type:
-        #   bull OB (bearish candle before upward displacement) → STRONG BUY
-        #   bear OB (bullish candle before downward displacement) → STRONG SELL
+        # ── STRONG signal conditions ─────────────────────────────────────
+        # 1. Price is inside the entry zone
+        # 2. RSI(14) between 48 and 52 — Momentum Reset
+        # 3. EMA 9 pulling back toward EMA 50 but has not yet crossed it:
+        #      bull → EMA9 > EMA50 AND EMA9 declining (ema9_val < ema9_prev)
+        #      bear → EMA9 < EMA50 AND EMA9 rising   (ema9_val > ema9_prev)
         rsi_reset     = RSI_ZONE_LOW <= rsi_val <= RSI_ZONE_HIGH
         price_in_zone = ob_status == "FOUND" and ob_low <= price <= ob_high
 
+        ema_bull_pullback = ema9_val > ema50_val and ema9_val < ema9_prev
+        ema_bear_pullback = ema9_val < ema50_val and ema9_val > ema9_prev
+
         if price_in_zone and rsi_reset:
-            if ob_side == "bull":
-                base["signal"]    = "STRONG BUY ▲"
-            elif ob_side == "bear":
-                base["signal"]    = "STRONG SELL ▼"
-                base["stop_loss"] = round(price + sl_distance, 5)
+            if ob_side == "bull" and ema_bull_pullback:
+                base["signal"] = "STRONG BUY ▲"
+                if swing_stop is not None:
+                    base["stop_loss"]        = round(swing_stop, 5)
+                    base["stop_loss_locked"] = True
+            elif ob_side == "bear" and ema_bear_pullback:
+                base["signal"] = "STRONG SELL ▼"
+                if swing_stop is not None:
+                    base["stop_loss"]        = round(swing_stop, 5)
+                    base["stop_loss_locked"] = True
+                else:
+                    base["stop_loss"] = round(price + sl_distance, 5)
         else:
             # ── WEAK fallback: existing 3-factor confluence ───────────────
             buy_score  = int(ema_bullish) + int(rsi_cross_above) + int(inst_load)
@@ -474,19 +588,24 @@ def compute_signal(df: pd.DataFrame, label: str, asset_class: str) -> dict:
 def _apply_realtime_price(result: dict, rt: float, atr_val: float) -> None:
     """Override price and recalculate stop around the live price in-place.
 
-    The entry zone is NOT updated when it was set by an Order Block
-    (entry_zone_locked == True) — the OB zone must remain stable.
+    The entry zone is NOT updated when it was set by an Order Block / FVG
+    (entry_zone_locked == True) — the zone must remain stable.
+
+    The stop loss is NOT recalculated when it was derived from the
+    displacement swing high/low (stop_loss_locked == True) — a fixed
+    structural level that should not shift with the live price.
     """
     sl_distance = ATR_MULTIPLIER * atr_val
     result["price"] = round(rt, 5)
     if not result.get("entry_zone_locked", False):
-        # No OB zone: clear any stale price-based zone so it does not display
+        # No OB/FVG zone: clear any stale price-based zone so it does not display
         result["entry_low"]  = None
         result["entry_high"] = None
-    if "SELL" in result["signal"]:
-        result["stop_loss"] = round(rt + sl_distance, 5)
-    else:
-        result["stop_loss"] = round(rt - sl_distance, 5)
+    if not result.get("stop_loss_locked", False):
+        if "SELL" in result["signal"]:
+            result["stop_loss"] = round(rt + sl_distance, 5)
+        else:
+            result["stop_loss"] = round(rt - sl_distance, 5)
 
 
 def _yf_realtime_price(ticker: str) -> Optional[float]:
@@ -843,12 +962,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="hdr">
   <div>
     <div class="logo">SIGNAL<span>IQ</span></div>
-    <div class="tagline">Intraday Confluence Engine · EMA 9/50 + RSI Cross-50 + VSA · WebSocket Live Feed</div>
+    <div class="tagline">Sniper Calculation Engine · FVG/OB Entry · RSI Reset 48–52 · EMA Pullback · RVOL ≥ 1.8</div>
   </div>
   <div class="hdr-right">
     <div class="stat-item">
       <span class="stat-label">Strategy</span>
-      <span class="stat-val" style="font-size:10px;">EMA9/50 · RSI14 · VSA</span>
+      <span class="stat-val" style="font-size:10px;">FVG/OB · RSI48-52 · RVOL≥1.8</span>
     </div>
     <div class="stat-item">
       <span class="stat-label">Last Updated</span>
@@ -862,10 +981,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="strategy-bar">
-  <span class="badge">EMA 9/50 Dual Trend Filter</span>
-  <span class="badge">RSI Cross 50 Trigger</span>
-  <span class="badge">Vol Spike ≥ 150% + Spread &gt; Avg</span>
-  <span class="badge">Stop = 1.0× ATR</span>
+  <span class="badge">Displacement Body &gt; 2.5× ATR(10)</span>
+  <span class="badge">FVG: High[C1]→Low[C3] Midpoint Entry</span>
+  <span class="badge">RSI Reset 48–52</span>
+  <span class="badge">EMA 9 Pullback → EMA 50</span>
+  <span class="badge">RVOL ≥ 1.8 Institutional Gate</span>
+  <span class="badge">Stop = Displacement Swing High/Low</span>
   <span class="badge">15 Assets Live</span>
 </div>
 
