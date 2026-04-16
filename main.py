@@ -67,7 +67,7 @@ VOLUME_THRESHOLD = 1.50   # 50 % above avg
 ATR_MULTIPLIER   = 1.5
 MIN_CANDLES      = 220    # need at least EMA_PERIOD + buffer
 
-REFRESH_SECONDS  = 30   # 30s cycle — faster signal detection
+REFRESH_SECONDS  = 5    # 5s cycle — near-live signal detection
 
 # ─────────────────────────────────────────────
 #  DATABASE  (optional – bot runs without it)
@@ -593,14 +593,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </tr>`;
       }).join('');
       document.getElementById('ts').textContent = data.last_updated;
-      document.getElementById('status').textContent = 'Live · Auto-refresh every 60s';
+      document.getElementById('status').textContent = 'Live · Auto-refresh every 1s';
     } catch(e) {
       document.getElementById('status').textContent = '⚠ Fetch error — retrying...';
     }
   }
 
   refresh();
-  setInterval(refresh, 60000);
+  setInterval(refresh, 1000);
 </script>
 </body>
 </html>
