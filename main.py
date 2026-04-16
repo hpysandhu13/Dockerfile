@@ -1286,8 +1286,8 @@ socketio = SocketIO(app, cors_allowed_origins=os.getenv("CORS_ORIGINS", "*"),
                    async_mode="threading")
 
 @app.route("/")
-def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+def health_check():
+    return "Bot is running perfectly!", 200
 
 @app.route("/health")
 def health():
