@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v2.0              ║
-║     Smart Money Confluence Engine                            ║
-║     Strategy: 200 EMA + RSI(14) + Volume Spread Analysis    ║
+║     INSTITUTIONAL SIGNAL INTELLIGENCE BOT v3.0              ║
+║     Smart Money Confluence Engine — WebSocket Live Feed      ║
+║     Strategy: 200 EMA + RSI(14) + Volume Spread Analysis     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -18,6 +18,7 @@ import pandas as pd
 import yfinance as yf
 import ccxt
 from flask import Flask, render_template_string, jsonify
+from flask_socketio import SocketIO
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -67,7 +68,8 @@ VOLUME_THRESHOLD = 1.50   # 50 % above avg
 ATR_MULTIPLIER   = 1.5
 MIN_CANDLES      = 220    # need at least EMA_PERIOD + buffer
 
-REFRESH_SECONDS  = 5    # 5s cycle — near-live signal detection
+REFRESH_SECONDS  = 60   # Full signal / indicator cycle interval
+EMIT_SECONDS     = 1    # WebSocket emission cadence
 
 # ─────────────────────────────────────────────
 #  DATABASE  (optional – bot runs without it)
@@ -291,6 +293,7 @@ def fetch_ccxt(symbol: str, label: str, exchange_id: str = "binance") -> dict:
 _signal_cache: list  = []
 _last_updated: str   = "—"
 _cache_lock          = threading.Lock()
+_prev_prices: dict   = {}   # { asset_label: last_emitted_price }
 
 def run_all_signals():
     results = []
@@ -321,7 +324,17 @@ def run_all_signals():
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     with _cache_lock:
-        global _signal_cache, _last_updated
+        global _signal_cache, _last_updated, _prev_prices
+        for r in results:
+            label      = r["asset"]
+            curr_price = r.get("price")
+            prev_price = _prev_prices.get(label)
+            if curr_price is not None and prev_price is not None and prev_price != 0:
+                r["change_pct"] = round((curr_price - prev_price) / prev_price * 100, 4)
+            else:
+                r["change_pct"] = 0.0
+            if curr_price is not None:
+                _prev_prices[label] = curr_price
         _signal_cache  = results
         _last_updated  = ts
 
@@ -335,297 +348,509 @@ def background_loop():
             log.error(f"Unhandled error in signal loop: {e}")
         time.sleep(REFRESH_SECONDS)
 
+def emission_loop():
+    """Push the latest cached data to all connected WebSocket clients every second."""
+    while True:
+        try:
+            with _cache_lock:
+                data = {
+                    "last_updated": _last_updated,
+                    "signals":      list(_signal_cache),
+                }
+            if data["signals"]:
+                socketio.emit("price_update", data)
+        except Exception as e:
+            log.error(f"Emit error: {e}")
+        time.sleep(EMIT_SECONDS)
+
 # ─────────────────────────────────────────────
-#  HTML DASHBOARD
+#  HTML DASHBOARD  (Bloomberg Midnight Theme)
 # ─────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Institutional Signal Intelligence</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@700;800&display=swap" rel="stylesheet"/>
+<title>SIGNALIQ — Institutional Live Feed</title>
 <style>
-  :root {
-    --bg:        #07090f;
-    --surface:   #0e1117;
-    --border:    #1c2030;
-    --accent:    #00e5ff;
-    --buy:       #00ff9d;
-    --sell:      #ff3d71;
-    --neutral:   #4a5278;
-    --text:      #cdd6f4;
-    --muted:     #6272a4;
-    --gold:      #f5c542;
-  }
+  /* ── Bloomberg Midnight Theme ─────────────── */
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
+  :root {
+    --bg:     #000000;
+    --panel:  #060606;
+    --border: #1a1a1a;
+    --green:  #00ff9d;
+    --red:    #ff3d71;
+    --cyan:   #00e5ff;
+    --amber:  #ffb700;
+    --white:  #ffffff;
+    --muted:  #555555;
+    --text:   #cccccc;
+    --font:   'Courier New', Courier, monospace;
+  }
+  html, body {
     background: var(--bg);
     color: var(--text);
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--font);
+    font-size: 13px;
     min-height: 100vh;
-    padding: 2rem;
   }
-  header {
+  /* ── Header ───────────────────────────────── */
+  .hdr {
     display: flex;
     justify-content: space-between;
-    align-items: flex-end;
-    margin-bottom: 2.5rem;
+    align-items: center;
+    padding: 8px 16px;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 1.2rem;
+    background: var(--bg);
   }
   .logo {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.5rem;
-    font-weight: 800;
-    letter-spacing: -0.03em;
-    color: #fff;
+    font-size: 20px;
+    font-weight: bold;
+    letter-spacing: 5px;
+    color: var(--cyan);
+    text-transform: uppercase;
   }
-  .logo span { color: var(--accent); }
-  .meta {
-    font-size: 0.7rem;
-    color: var(--muted);
-    text-align: right;
-    line-height: 1.8;
-  }
-  .meta .ts { color: var(--accent); }
-  .badge-row {
+  .logo span { color: var(--white); }
+  .tagline { font-size: 9px; color: var(--muted); letter-spacing: 2px; margin-top: 2px; }
+  .hdr-right { display: flex; gap: 24px; align-items: center; }
+  .stat-item { display: flex; flex-direction: column; align-items: flex-end; }
+  .stat-label { font-size: 9px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; }
+  .stat-val   { color: var(--cyan); font-weight: bold; font-size: 12px; }
+  /* ── WS status dot ────────────────────────── */
+  .ws-status { display: flex; align-items: center; gap: 6px; font-size: 10px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .dot.live  { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.dead  { background: var(--red);   box-shadow: 0 0 8px var(--red); }
+  /* ── Strategy bar ─────────────────────────── */
+  .strategy-bar {
+    padding: 4px 16px;
+    border-bottom: 1px solid var(--border);
     display: flex;
-    gap: 0.6rem;
-    margin-bottom: 1.8rem;
+    gap: 10px;
     flex-wrap: wrap;
+    background: #040404;
   }
   .badge {
-    font-size: 0.65rem;
-    padding: 0.25rem 0.65rem;
-    border: 1px solid var(--border);
-    border-radius: 2px;
+    font-size: 9px;
     color: var(--muted);
-    letter-spacing: 0.08em;
+    letter-spacing: 1.5px;
     text-transform: uppercase;
+    padding: 1px 7px;
+    border: 1px solid #1a1a1a;
   }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.78rem;
-  }
-  thead tr {
-    border-bottom: 1px solid var(--accent);
-  }
+  /* ── Table ────────────────────────────────── */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead { background: #040404; position: sticky; top: 0; z-index: 10; }
   th {
-    padding: 0.6rem 1rem;
+    padding: 5px 10px;
     text-align: left;
-    font-size: 0.62rem;
-    letter-spacing: 0.12em;
+    font-size: 9px;
+    letter-spacing: 2px;
     text-transform: uppercase;
     color: var(--muted);
-    font-weight: 600;
+    border-bottom: 1px solid var(--cyan);
+    white-space: nowrap;
+    font-weight: normal;
   }
-  tbody tr {
-    border-bottom: 1px solid var(--border);
-    transition: background 0.15s;
-  }
-  tbody tr:hover { background: #ffffff06; }
-  td {
-    padding: 0.85rem 1rem;
-    vertical-align: middle;
-  }
-  .asset-name { color: #fff; font-weight: 600; font-size: 0.82rem; }
-  .asset-class {
-    display: inline-block;
-    font-size: 0.6rem;
-    padding: 0.1rem 0.4rem;
-    border-radius: 2px;
-    letter-spacing: 0.1em;
+  tr.data-row { border-bottom: 1px solid var(--border); }
+  tr.data-row:hover { background: #0a0a0a; }
+  td { padding: 5px 10px; vertical-align: middle; white-space: nowrap; }
+  tr.sec-hdr td {
+    font-size: 9px;
+    letter-spacing: 2px;
     text-transform: uppercase;
-    margin-top: 0.2rem;
-  }
-  .cls-crypto    { background: #1a1440; color: #a78bfa; border: 1px solid #2d1f66; }
-  .cls-forex     { background: #0d2035; color: #38bdf8; border: 1px solid #1a3d5c; }
-  .cls-commodity { background: #1f1800; color: var(--gold); border: 1px solid #4a3800; }
-  .price { color: #fff; font-weight: 600; font-size: 0.85rem; }
-  .signal {
-    font-weight: 600;
-    font-size: 0.78rem;
-    padding: 0.3rem 0.7rem;
-    border-radius: 3px;
-    display: inline-block;
-    letter-spacing: 0.05em;
-  }
-  .sig-buy     { background: #00271a; color: var(--buy);  border: 1px solid #00ff9d44; }
-  .sig-sell    { background: #2a0010; color: var(--sell); border: 1px solid #ff3d7144; }
-  .sig-neutral { background: #111420; color: var(--neutral); border: 1px solid #1c2030; }
-  .zone        { color: var(--text); font-size: 0.75rem; }
-  .sl-val      { color: var(--sell); font-size: 0.75rem; }
-  .rsi-chip {
-    display: inline-block;
-    font-size: 0.68rem;
-    padding: 0.15rem 0.45rem;
-    border-radius: 2px;
-    border: 1px solid var(--border);
+    padding: 4px 10px;
     color: var(--muted);
+    background: #040404;
+    border-top: 1px solid var(--border);
   }
-  .rsi-low    { color: var(--buy);  border-color: #00ff9d44; background: #00271a; }
-  .rsi-high   { color: var(--sell); border-color: #ff3d7144; background: #2a0010; }
-  .err { color: #ff6b6b; font-size: 0.7rem; }
+  /* ── Asset name ───────────────────────────── */
+  .asset-name { color: var(--white); font-weight: bold; font-size: 13px; }
+  /* ── Class tags ───────────────────────────── */
+  .tag { font-size: 9px; padding: 1px 5px; letter-spacing: 1px; text-transform: uppercase; border: 1px solid; }
+  .tag-crypto    { color: #a78bfa; border-color: #3d2f8a; }
+  .tag-forex     { color: #38bdf8; border-color: #1a4a6a; }
+  .tag-commodity { color: var(--amber); border-color: #5a4000; }
+  /* ── Price cell ───────────────────────────── */
+  .price-cell {
+    color: var(--white);
+    font-weight: bold;
+    font-size: 14px;
+    display: inline-block;
+    min-width: 90px;
+  }
+  /* ── Change % ─────────────────────────────── */
+  .chg-up   { color: var(--green); }
+  .chg-down { color: var(--red); }
+  .chg-flat { color: var(--muted); }
+  /* ── Signal pill ──────────────────────────── */
+  .sig {
+    font-size: 10px;
+    font-weight: bold;
+    padding: 2px 8px;
+    letter-spacing: 1px;
+    display: inline-block;
+    border: 1px solid;
+  }
+  .sig-buy  { color: var(--green); border-color: #00ff9d44; background: #001f10; }
+  .sig-sell { color: var(--red);   border-color: #ff3d7144; background: #200010; }
+  .sig-neu  { color: var(--muted); border-color: #1a1a1a;   background: #040404; }
+  /* ── RSI chip ─────────────────────────────── */
+  .rsi-chip { font-size: 11px; padding: 1px 6px; border: 1px solid var(--border); }
+  .rsi-low  { color: var(--green); border-color: #00ff9d44; background: #001f10; }
+  .rsi-high { color: var(--red);   border-color: #ff3d7144; background: #200010; }
+  /* ── Sparkline canvas ─────────────────────── */
+  .spark { display: block; }
+  /* ── Flash animations ─────────────────────── */
+  @keyframes flashUp {
+    0%   { background: rgba(0,255,157,0.30); color: #00ff9d; }
+    100% { background: transparent;          color: #ffffff; }
+  }
+  @keyframes flashDown {
+    0%   { background: rgba(255,61,113,0.30); color: #ff3d71; }
+    100% { background: transparent;           color: #ffffff; }
+  }
+  .flash-up   { animation: flashUp   0.7s ease-out forwards; }
+  .flash-down { animation: flashDown 0.7s ease-out forwards; }
+  /* ── Footer ───────────────────────────────── */
+  footer {
+    padding: 5px 16px;
+    font-size: 9px;
+    color: var(--muted);
+    letter-spacing: 1px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+  }
   .spinner {
     display: inline-block;
     width: 8px; height: 8px;
     border: 1px solid var(--muted);
-    border-top-color: var(--accent);
+    border-top-color: var(--cyan);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
-    margin-right: 6px;
     vertical-align: middle;
+    margin-right: 4px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  footer {
-    margin-top: 2.5rem;
-    font-size: 0.62rem;
-    color: var(--muted);
-    letter-spacing: 0.06em;
-    border-top: 1px solid var(--border);
-    padding-top: 1rem;
-    display: flex;
-    justify-content: space-between;
-  }
-  #status { color: var(--accent); }
-  @media (max-width: 768px) {
-    body { padding: 1rem; }
-    table { font-size: 0.7rem; }
-    th, td { padding: 0.6rem 0.5rem; }
-  }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); }
 </style>
 </head>
 <body>
-<header>
+
+<div class="hdr">
   <div>
     <div class="logo">SIGNAL<span>IQ</span></div>
-    <div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">Institutional Smart Money Confluence Engine</div>
+    <div class="tagline">Institutional Smart Money Confluence Engine · WebSocket Live Feed</div>
   </div>
-  <div class="meta">
-    Strategy: 200 EMA · RSI(14) · Volume Spread Analysis<br/>
-    Last Updated: <span class="ts" id="ts">—</span>
+  <div class="hdr-right">
+    <div class="stat-item">
+      <span class="stat-label">Strategy</span>
+      <span class="stat-val" style="font-size:10px;">EMA200 · RSI14 · VSA</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Last Updated</span>
+      <span class="stat-val" id="ts">—</span>
+    </div>
+    <div class="ws-status">
+      <div class="dot" id="dot"></div>
+      <span id="ws-label" style="color:var(--muted);">CONNECTING</span>
+    </div>
   </div>
-</header>
-
-<div class="badge-row">
-  <div class="badge">EMA 200 Trend Filter</div>
-  <div class="badge">RSI &lt;30 / &gt;70 Extreme</div>
-  <div class="badge">Vol Spike ≥ 150% Avg</div>
-  <div class="badge">Stop = 1.5× ATR</div>
 </div>
 
+<div class="strategy-bar">
+  <span class="badge">EMA 200 Trend Filter</span>
+  <span class="badge">RSI &lt;30 / &gt;70 Extreme</span>
+  <span class="badge">Vol Spike ≥ 150% Avg</span>
+  <span class="badge">Stop = 1.5× ATR</span>
+  <span class="badge">15 Assets Live</span>
+</div>
+
+<div class="table-wrap">
 <table>
   <thead>
     <tr>
       <th>Asset</th>
       <th>Class</th>
       <th>Price</th>
+      <th>Change&nbsp;%</th>
       <th>Signal</th>
+      <th>Trend (30T)</th>
+      <th>RSI(14)</th>
       <th>Entry Zone</th>
       <th>Stop Loss</th>
-      <th>RSI(14)</th>
     </tr>
   </thead>
   <tbody id="tbody">
-    <tr><td colspan="7" style="text-align:center;padding:3rem;color:var(--muted);">
-      <span class="spinner"></span> Fetching institutional data...
+    <tr><td colspan="9" style="text-align:center;padding:50px;color:#555;">
+      <span class="spinner"></span>Connecting to live WebSocket feed...
     </td></tr>
   </tbody>
 </table>
+</div>
 
 <footer>
-  <span>SIGNALIQ · For informational purposes only · Not financial advice</span>
-  <span id="status">Initialising...</span>
+  <span>SIGNALIQ · FOR INFORMATIONAL PURPOSES ONLY · NOT FINANCIAL ADVICE</span>
+  <span id="tick-ctr">TICKS: 0</span>
 </footer>
 
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-  const fmt = (v, d=5) => v != null ? Number(v).toFixed(d) : '—';
+// ── Constants ──────────────────────────────────────────────────────────
+const MAX_PTS = 30;
 
-  function classTag(cls) {
-    const map = { CRYPTO:'crypto', FOREX:'forex', COMMODITY:'commodity' };
-    const labels = { CRYPTO:'Crypto', FOREX:'Forex', COMMODITY:'Commodity' };
-    const k = map[cls] || 'forex';
-    return `<span class="asset-class cls-${k}">${labels[cls] || cls}</span>`;
+// Stable display order and section breaks
+const ASSET_ORDER = [
+  'Bitcoin','Ethereum','Solana','BNB','XRP','Avalanche',
+  'EUR/USD','GBP/USD','USD/JPY','AUD/USD',
+  'Gold','Silver','Crude Oil','Nat. Gas','Platinum'
+];
+const SECTION_START = { 'Bitcoin':'CRYPTO', 'EUR/USD':'FOREX', 'Gold':'COMMODITY' };
+
+// ── Per-asset client-side state ────────────────────────────────────────
+const priceHistory = {};   // { label: [p1, p2, ...] }
+const prevPrices   = {};   // { label: lastSeenPrice }
+
+let tickCount   = 0;
+let tableBuilt  = false;
+
+// ── Decimal places per asset ───────────────────────────────────────────
+function pDec(asset) {
+  if (['Bitcoin','Ethereum'].includes(asset))            return 2;
+  if (['BNB','Solana','Avalanche'].includes(asset))      return 2;
+  if (['Gold','Silver','Platinum'].includes(asset))      return 2;
+  if (['Crude Oil','Nat. Gas'].includes(asset))          return 3;
+  if (['XRP'].includes(asset))                           return 4;
+  return 5;
+}
+
+// ── Formatting helpers ─────────────────────────────────────────────────
+function fmt(v, d) { return v != null ? Number(v).toFixed(d) : '—'; }
+
+function classTag(cls) {
+  const map = { CRYPTO:['crypto','Crypto'], FOREX:['forex','Forex'], COMMODITY:['commodity','Cmdty'] };
+  const [c, l] = map[cls] || ['forex', cls];
+  return `<span class="tag tag-${c}">${l}</span>`;
+}
+
+function signalTag(sig) {
+  if (!sig)               return `<span class="sig sig-neu">NEUTRAL</span>`;
+  if (sig.includes('BUY'))  return `<span class="sig sig-buy">${sig}</span>`;
+  if (sig.includes('SELL')) return `<span class="sig sig-sell">${sig}</span>`;
+  return `<span class="sig sig-neu">NEUTRAL</span>`;
+}
+
+function rsiTag(v) {
+  if (v == null) return '<span class="rsi-chip">—</span>';
+  const cls = v < 30 ? 'rsi-low' : v > 70 ? 'rsi-high' : '';
+  return `<span class="rsi-chip ${cls}">${v}</span>`;
+}
+
+function chgTag(pct) {
+  if (pct == null || pct === 0) return `<span class="chg-flat">—</span>`;
+  const sign  = pct > 0 ? '+' : '';
+  const cls   = pct > 0 ? 'chg-up' : 'chg-down';
+  const arrow = pct > 0 ? '▲' : '▼';
+  return `<span class="${cls}">${sign}${pct.toFixed(4)}%&nbsp;${arrow}</span>`;
+}
+
+// ── Glow / flash effect ────────────────────────────────────────────────
+function flashCell(cell, dir) {
+  cell.classList.remove('flash-up', 'flash-down');
+  void cell.offsetWidth;   // trigger reflow so the animation restarts cleanly
+  cell.classList.add(dir === 'up' ? 'flash-up' : 'flash-down');
+}
+
+// ── Canvas sparkline ───────────────────────────────────────────────────
+function drawSparkline(canvas, data) {
+  if (!canvas || !data || data.length < 2) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const min   = Math.min(...data);
+  const max   = Math.max(...data);
+  const range = (max - min) || (min * 0.001) || 1;
+  const isUp  = data[data.length - 1] >= data[data.length - 2];
+  const color = isUp ? '#00ff9d' : '#ff3d71';
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 1.5;
+  ctx.shadowColor = color;
+  ctx.shadowBlur  = 4;
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = (i / (data.length - 1)) * w;
+    const y = (h - 2) - ((v - min) / range) * (h - 4);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+// ── Row ID helper ──────────────────────────────────────────────────────
+function rowId(asset) { return 'row-' + asset.replace(/[^a-z0-9]/gi, '_'); }
+function pcId(asset)  { return 'pc-'  + asset.replace(/[^a-z0-9]/gi, '_'); }
+
+// ── Build initial table ────────────────────────────────────────────────
+function buildTable(signals) {
+  const byAsset = {};
+  signals.forEach(r => { byAsset[r.asset] = r; });
+
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+
+  ASSET_ORDER.forEach(name => {
+    const r = byAsset[name];
+    if (!r) return;
+
+    if (SECTION_START[name]) {
+      const sh = document.createElement('tr');
+      sh.className = 'sec-hdr';
+      sh.innerHTML = `<td colspan="9">${SECTION_START[name]}</td>`;
+      tbody.appendChild(sh);
+    }
+
+    const tr = document.createElement('tr');
+    tr.id        = rowId(name);
+    tr.className = 'data-row';
+    tr.innerHTML = buildCells(r, 'flat');
+    tbody.appendChild(tr);
+
+    if (r.price != null) {
+      priceHistory[name] = [r.price];
+      prevPrices[name]   = r.price;
+    }
+  });
+
+  tableBuilt = true;
+}
+
+// ── Build all <td> content for a row ──────────────────────────────────
+function buildCells(r, dir) {
+  const d    = pDec(r.asset);
+  const zone = (r.entry_low != null && r.entry_high != null)
+    ? `${fmt(r.entry_low, d)} – ${fmt(r.entry_high, d)}`
+    : '—';
+  const sl  = r.stop_loss != null
+    ? `<span style="color:var(--red);">${fmt(r.stop_loss, d)}</span>`
+    : '—';
+  const err = r.error
+    ? `<span style="font-size:9px;color:#ff6b6b;display:block;">⚠ ${r.error}</span>`
+    : '';
+
+  return `
+    <td><span class="asset-name">${r.asset}</span>${err}</td>
+    <td>${classTag(r.asset_class)}</td>
+    <td><span class="price-cell" id="${pcId(r.asset)}">${r.price != null ? fmt(r.price, d) : '—'}</span></td>
+    <td>${chgTag(r.change_pct)}</td>
+    <td>${signalTag(r.signal)}</td>
+    <td><canvas class="spark" width="80" height="26"></canvas></td>
+    <td>${rsiTag(r.rsi)}</td>
+    <td style="font-size:11px;">${zone}</td>
+    <td style="font-size:11px;">${sl}</td>
+  `;
+}
+
+// ── Update a single row in-place ───────────────────────────────────────
+function updateRow(r) {
+  const name = r.asset;
+  const row  = document.getElementById(rowId(name));
+  if (!row) return;
+
+  const d         = pDec(name);
+  const currPrice = r.price;
+  const prev      = prevPrices[name];
+  let   dir       = 'flat';
+  if (currPrice != null && prev != null) {
+    if      (currPrice > prev) dir = 'up';
+    else if (currPrice < prev) dir = 'down';
   }
 
-  function signalTag(sig) {
-    if (!sig) return `<span class="signal sig-neutral">NEUTRAL</span>`;
-    if (sig.includes('BUY'))  return `<span class="signal sig-buy">${sig}</span>`;
-    if (sig.includes('SELL')) return `<span class="signal sig-sell">${sig}</span>`;
-    return `<span class="signal sig-neutral">NEUTRAL</span>`;
+  // Append to sparkline history only when price actually changes
+  if (currPrice != null) {
+    if (!priceHistory[name]) priceHistory[name] = [];
+    const hist = priceHistory[name];
+    if (hist.length === 0 || hist[hist.length - 1] !== currPrice) {
+      hist.push(currPrice);
+      if (hist.length > MAX_PTS) hist.shift();
+    }
+    prevPrices[name] = currPrice;
   }
 
-  function rsiTag(v) {
-    if (v == null) return '—';
-    const cls = v < 30 ? 'rsi-low' : v > 70 ? 'rsi-high' : '';
-    return `<span class="rsi-chip ${cls}">${v}</span>`;
-  }
-
-  async function refresh() {
-    document.getElementById('status').innerHTML = '<span class="spinner"></span>Refreshing...';
-    try {
-      const res  = await fetch('/api/signals');
-      const data = await res.json();
-      const tbody = document.getElementById('tbody');
-      const pDec = (asset) => {
-        if (['Bitcoin','Ethereum'].includes(asset)) return 2;
-        if (['Gold','Silver'].includes(asset)) return 3;
-        return 5;
-      };
-      tbody.innerHTML = data.signals.map(r => {
-        const d = pDec(r.asset);
-        const zone = (r.entry_low != null && r.entry_high != null)
-          ? `${fmt(r.entry_low,d)} – ${fmt(r.entry_high,d)}`
-          : '—';
-        const sl   = r.stop_loss != null ? `<span class="sl-val">${fmt(r.stop_loss,d)}</span>` : '—';
-        const err  = r.error ? `<br/><span class="err">⚠ ${r.error}</span>` : '';
-        return `<tr>
-          <td><span class="asset-name">${r.asset}</span>${err}</td>
-          <td>${classTag(r.asset_class)}</td>
-          <td><span class="price">${r.price != null ? fmt(r.price, d) : '—'}</span></td>
-          <td>${signalTag(r.signal)}</td>
-          <td class="zone">${zone}</td>
-          <td>${sl}</td>
-          <td>${rsiTag(r.rsi)}</td>
-        </tr>`;
-      }).join('');
-      document.getElementById('ts').textContent = data.last_updated;
-      document.getElementById('status').textContent = 'Live · Auto-refresh every 1s';
-    } catch(e) {
-      document.getElementById('status').textContent = '⚠ Fetch error — retrying...';
+  // Update price cell with flash
+  const pc = document.getElementById(pcId(name));
+  if (pc && currPrice != null) {
+    const formatted = fmt(currPrice, d);
+    if (pc.textContent !== formatted) {
+      pc.textContent = formatted;
+      if (dir !== 'flat') flashCell(pc, dir);
     }
   }
 
-  refresh();
-  setInterval(refresh, 1000);
+  // Update Change %, Signal, RSI via cell index (stable column order)
+  const cells = row.cells;
+  if (cells[3]) cells[3].innerHTML = chgTag(r.change_pct);
+  if (cells[4]) cells[4].innerHTML = signalTag(r.signal);
+  if (cells[6]) cells[6].innerHTML = rsiTag(r.rsi);
+
+  // Redraw sparkline
+  const canvas = row.querySelector('.spark');
+  if (canvas && priceHistory[name] && priceHistory[name].length >= 2) {
+    drawSparkline(canvas, priceHistory[name]);
+  }
+}
+
+// ── Socket.io connection ───────────────────────────────────────────────
+const socket = io({ transports: ['websocket', 'polling'] });
+
+socket.on('connect', () => {
+  document.getElementById('dot').className      = 'dot live';
+  document.getElementById('ws-label').textContent  = 'LIVE';
+  document.getElementById('ws-label').style.color  = '#00ff9d';
+});
+
+socket.on('disconnect', () => {
+  document.getElementById('dot').className      = 'dot dead';
+  document.getElementById('ws-label').textContent  = 'DISCONNECTED';
+  document.getElementById('ws-label').style.color  = '#ff3d71';
+});
+
+socket.on('price_update', (data) => {
+  tickCount++;
+  document.getElementById('tick-ctr').textContent = `TICKS: ${tickCount}`;
+  document.getElementById('ts').textContent        = data.last_updated;
+
+  if (!tableBuilt || !document.getElementById(rowId('Bitcoin'))) {
+    buildTable(data.signals);
+  } else {
+    data.signals.forEach(r => updateRow(r));
+  }
+});
 </script>
 </body>
 </html>
 """
 
 # ─────────────────────────────────────────────
-#  FLASK APP
+#  FLASK + SOCKET.IO APP
 # ─────────────────────────────────────────────
-app = Flask(__name__)
+app      = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins=os.getenv("CORS_ORIGINS", "*"),
+                   async_mode="threading")
 
 @app.route("/")
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
-@app.route("/api/signals")
-def api_signals():
-    with _cache_lock:
-        return jsonify({
-            "last_updated": _last_updated,
-            "signals":      _signal_cache,
-        })
-
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "last_updated": _last_updated}), 200
+    with _cache_lock:
+        return jsonify({"status": "ok", "last_updated": _last_updated}), 200
 
 # ─────────────────────────────────────────────
 #  ENTRY POINT
@@ -635,11 +860,17 @@ if __name__ == "__main__":
     init_db()
 
     log.info("Running first signal cycle (blocking)...")
-    run_all_signals()   # run once synchronously so dashboard loads with data
+    run_all_signals()   # populate cache before clients connect
 
     log.info("Starting background signal thread...")
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
+    t_signals = threading.Thread(target=background_loop, daemon=True)
+    t_signals.start()
 
-    log.info("Flask server starting on 0.0.0.0:8080")
-    app.run(host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+    log.info("Starting WebSocket emission thread...")
+    t_emit = threading.Thread(target=emission_loop, daemon=True)
+    t_emit.start()
+
+    log.info("Flask-SocketIO server starting on 0.0.0.0:8080")
+    # allow_unsafe_werkzeug is acceptable here; use Gunicorn+gevent in production
+    socketio.run(app, host="0.0.0.0", port=8080, debug=False,
+                 allow_unsafe_werkzeug=True)

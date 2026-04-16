@@ -6,6 +6,10 @@
 # Web framework
 flask>=3.0.0
 
+# WebSocket real-time layer
+flask-socketio>=5.3.0
+simple-websocket>=1.0.0
+
 # Market data
 yfinance>=0.2.40
 ccxt>=4.3.0
