@@ -1,7 +1,23 @@
-ccxt
-yfinance
-pandas
-pandas_ta
-psycopg2-binary
-textblob
-requests
+@@ -1,2 +1,21 @@
+# Used for fetching market data in trading cycles
+# Core async runtime
+asyncpg==0.30.0
+
+# Crypto exchange connectivity
+ccxt==4.4.59
+
+# Forex / Commodity market data
+yfinance==0.2.55
+
+# Data analysis & technical indicators
+pandas==2.2.3
+numpy==1.26.4
+
+# Sentiment analysis
+textblob==0.18.0
+
+# HTTP client (NewsAPI integration)
+aiohttp==3.13.3
+
+# requests kept for transitive compatibility
+requests==2.32.3
