@@ -1,9 +1,21 @@
-flask==3.0.0
-ccxt==4.4.59
-yfinance==0.2.40
-pandas==2.1.4
-numpy==1.26.2
-asyncpg==0.29.0
-textblob==0.17.1
-aiohttp==3.9.1
-requests==2.31.0
+# ─────────────────────────────────────────────
+#  Institutional Signal Intelligence Bot
+#  requirements.txt
+# ─────────────────────────────────────────────
+
+# Web framework
+flask>=3.0.0
+
+# Market data
+yfinance>=0.2.40
+ccxt>=4.3.0
+
+# Data / numerics
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Database (optional – bot runs without it)
+psycopg2-binary>=2.9.9
+
+# HTTP (yfinance/ccxt dependency – pin for stability)
+requests>=2.31.0
