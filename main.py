@@ -37,12 +37,12 @@ log = logging.getLogger("SignalBot")
 # ─────────────────────────────────────────────
 WATCHLIST = {
     "crypto": [
-        {"id": "BTC/USDT",  "label": "Bitcoin",    "exchange": "binance"},
-        {"id": "ETH/USDT",  "label": "Ethereum",   "exchange": "binance"},
-        {"id": "SOL/USDT",  "label": "Solana",     "exchange": "binance"},
-        {"id": "BNB/USDT",  "label": "BNB",        "exchange": "binance"},
-        {"id": "XRP/USDT",  "label": "XRP",        "exchange": "binance"},
-        {"id": "AVAX/USDT", "label": "Avalanche",  "exchange": "binance"},
+        {"id": "BTC/USDT",  "label": "Bitcoin",    "exchange": "kraken"},
+        {"id": "ETH/USDT",  "label": "Ethereum",   "exchange": "kraken"},
+        {"id": "SOL/USDT",  "label": "Solana",     "exchange": "kraken"},
+        {"id": "BNB/USDT",  "label": "BNB",        "exchange": "kraken"},
+        {"id": "XRP/USDT",  "label": "XRP",        "exchange": "kraken"},
+        {"id": "AVAX/USDT", "label": "Avalanche",  "exchange": "kraken"},
     ],
     "forex": [
         {"id": "EURUSD=X",  "label": "EUR/USD"},
@@ -662,7 +662,7 @@ def fetch_yfinance(ticker: str, label: str, asset_class: str) -> dict:
                 "stop_loss": None, "error": str(e)}
 
 
-def fetch_ccxt(symbol: str, label: str, exchange_id: str = "binance") -> dict:
+def fetch_ccxt(symbol: str, label: str, exchange_id: str = "kraken") -> dict:
     try:
         exchange_class = getattr(ccxt, exchange_id)
         exchange = exchange_class({"enableRateLimit": True})
